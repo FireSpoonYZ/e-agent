@@ -6,14 +6,13 @@ param(
 )
 
 $envFile = Join-Path $PSScriptRoot "..\.env"
-$line = Get-Content $envFile | Where-Object { $_ -match '^PYTHON_HOME=' } | Select-Object -First 1
+$line = Get-Content $envFile | Where-Object { $_ -match '^PYTHONHOME=' } | Select-Object -First 1
 if (-not $line) {
-    Write-Error "PYTHON_HOME is not set in $envFile"
+    Write-Error "PYTHONHOME is not set in $envFile"
     exit 1
 }
 
-$pythonHome = $line.Substring('PYTHON_HOME='.Length).Trim()
-$env:PYTHON_HOME = $pythonHome
+$pythonHome = $line.Substring('PYTHONHOME='.Length).Trim()
 $env:PYTHONHOME = $pythonHome
 $env:PATH = "$pythonHome;$env:PATH"
 

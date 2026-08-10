@@ -9,7 +9,7 @@ use async_openai::{
 };
 use pyo3::{PyResult, Python};
 use serde::Deserialize;
-use std::{ffi::CString, path::PathBuf};
+use std::ffi::CString;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -31,7 +31,8 @@ struct PythonArgs {
 
 #[tokio::main]
 async fn main() -> PyResult<()> {
-    dotenvy::dotenv().ok();
+    dotenvy::dotenv()
+        .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(format!("load .env: {err}")))?;
     init_logging();
 
     if let Err(err) = f().await {
@@ -47,11 +48,19 @@ async fn f() -> error::Result<()> {
     initialize_python()?;
 
     let mut tool_executor = tool::ToolExecutor::default();
-    let tool_path = std::env::var("E_AGENT_TOOL_PATH")
-        .map_err(|err| error::Error::Config(format!("E_AGENT_TOOL_PATH is not set: {err}")))?;
-    tool_executor
-        .load(tool_path)
-        .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(format!("{err:#}")))?;
+    let tool_paths = std::env::var_os("E_AGENT_TOOL_PATHS")
+        .ok_or_else(|| error::Error::Config("E_AGENT_TOOL_PATHS is not set".to_string()))?;
+    let tool_paths: Vec<_> = std::env::split_paths(&tool_paths).collect();
+    if tool_paths.is_empty() {
+        return Err(error::Error::Config(
+            "E_AGENT_TOOL_PATHS contains no paths".to_string(),
+        ));
+    }
+    for path in tool_paths {
+        tool_executor
+            .load(path)
+            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(format!("{err:#}")))?;
+    }
 
     println!("schema:\n{:#?}\n\n", tool_executor.tools());
 
@@ -241,19 +250,6 @@ fn parse_module_config(variable: &str, value: &str) -> error::Result<ModuleConfi
 }
 
 fn initialize_python() -> error::Result<()> {
-    dotenvy::dotenv().ok();
-    let home = PathBuf::from(
-        std::env::var("PYTHON_HOME")
-            .map_err(|err| error::Error::Config(format!("PYTHON_HOME is not set: {err}")))?,
-    );
-    if !home.join("Lib").is_dir() || !home.join("python3.dll").is_file() {
-        return Err(error::Error::Config(format!(
-            "PYTHON_HOME is not a CPython installation: {}",
-            home.display()
-        )));
-    }
-    // Python reads PYTHONHOME only during interpreter initialization.
-    unsafe { std::env::set_var("PYTHONHOME", home) };
     Python::initialize();
     Ok(())
 }

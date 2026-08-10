@@ -279,21 +279,18 @@ mod tests {
     use super::ToolExecutor;
 
     #[test]
-    #[ignore = "run after cargo build -p e-agent-helper-tools"]
+    #[ignore = "run after powershell -File scripts/build-tool.ps1 -Debug"]
     fn loads_compiled_rust_extension_file() {
         crate::initialize_python().unwrap();
-        let filename = format!(
-            "{}my_ext.{}",
-            std::env::consts::DLL_PREFIX,
-            std::env::consts::DLL_EXTENSION
-        );
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/debug")
-            .join(filename);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/my_ext.pyd");
         let mut executor = ToolExecutor::default();
         executor.load(path).unwrap();
+        executor
+            .load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pure_tools"))
+            .unwrap();
 
         let tools = executor.tools();
+        assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].name, "my_ext");
         assert_eq!(tools[0].functions.len(), 2);
         assert_eq!(
