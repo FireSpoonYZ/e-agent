@@ -44,7 +44,9 @@ fn expand_tool(function: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     }
     let mut fields = Vec::new();
     let mut python_fields = Vec::new();
+    let mut python_signature = Vec::new();
     let mut arguments = Vec::new();
+    let mut saw_optional = false;
 
     for argument in &function.sig.inputs {
         let FnArg::Typed(argument) = argument else {
@@ -61,9 +63,22 @@ fn expand_tool(function: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         };
         let ident = &pattern.ident;
         let ty = &argument.ty;
+        let optional = is_option(ty);
+        if saw_optional && !optional {
+            return Err(syn::Error::new_spanned(
+                argument,
+                "required parameters must precede optional parameters",
+            ));
+        }
+        saw_optional |= optional;
         let attrs = field_attributes(&argument.attrs)?;
         fields.push(quote!(#(#attrs)* #ident: #ty));
         python_fields.push(quote!(#ident: #ty));
+        python_signature.push(if optional {
+            quote!(#ident = None)
+        } else {
+            quote!(#ident)
+        });
         arguments.push(ident);
     }
 
@@ -98,7 +113,10 @@ fn expand_tool(function: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 }
             }
 
-            #[::e_agent_tool::__private::pyo3::pyfunction(name = #python_name)]
+            #[::e_agent_tool::__private::pyo3::pyfunction(
+                name = #python_name,
+                signature = (#(#python_signature),*)
+            )]
             pub(super) fn python(
                 py: ::e_agent_tool::__private::pyo3::Python,
                 #(#python_fields,)*
@@ -109,6 +127,14 @@ fn expand_tool(function: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             }
         }
     })
+}
+
+fn is_option(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Path(path)
+            if path.path.segments.last().is_some_and(|segment| segment.ident == "Option")
+    )
 }
 
 fn field_attributes(attributes: &[Attribute]) -> syn::Result<Vec<proc_macro2::TokenStream>> {

@@ -279,6 +279,70 @@ mod tests {
     use super::ToolExecutor;
 
     #[test]
+    #[ignore = "run after powershell -File scripts/build-basic-tools.ps1"]
+    fn loads_and_runs_basic_tools() {
+        crate::initialize_python().unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let path = root.join("target/debug/basic_tools.pyd");
+        let mut executor = ToolExecutor::default();
+        executor.load(path).unwrap();
+
+        let tools = executor.tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "basic_tools");
+        assert_eq!(
+            tools[0]
+                .functions
+                .iter()
+                .map(|function| function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read", "write", "edit", "bash"]
+        );
+        assert_eq!(
+            tools[0].functions[0].schema["required"],
+            serde_json::json!(["path"])
+        );
+        assert_eq!(
+            tools[0].functions[3].schema["required"],
+            serde_json::json!(["command"])
+        );
+
+        let fixture =
+            std::env::temp_dir().join(format!("e-agent-basic-tools-test-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let file = fixture.join("sample.txt");
+        let file = serde_json::to_string(&file.to_string_lossy()).unwrap();
+        let code = CString::new(format!(
+            r#"import asyncio, basic_tools
+async def main():
+    print(await basic_tools.write({file}, "alpha\n"))
+    print(await basic_tools.read({file}))
+    print(await basic_tools.edit({file}, [{{"old_text": "alpha", "new_text": "beta"}}]))
+    print(await basic_tools.bash("printf tool-ok"))
+    print(await basic_tools.read({file}, 1, 1))
+asyncio.run(main())"#
+        ))
+        .unwrap();
+
+        Python::attach(|py| {
+            pyo3_async_runtimes::tokio::run(py, async move {
+                let output = executor.call(&code).await.unwrap();
+                assert!(output.contains("Successfully wrote"));
+                assert!(output.contains("Successfully replaced"));
+                assert!(output.contains("tool-ok"));
+                assert!(output.contains("beta"));
+                Ok(())
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fixture.join("sample.txt")).unwrap(),
+            "beta\n"
+        );
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     #[ignore = "run after powershell -File scripts/build-tool.ps1 -Debug"]
     fn loads_compiled_rust_extension_file() {
         crate::initialize_python().unwrap();

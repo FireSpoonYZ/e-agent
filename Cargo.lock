@@ -313,6 +313,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "e-agent-basic-tools"
+version = "0.1.0"
+dependencies = [
+ "e-agent-tool",
+ "pyo3",
+ "schemars",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "e-agent-helper-tools"
 version = "0.1.0"
 dependencies = [

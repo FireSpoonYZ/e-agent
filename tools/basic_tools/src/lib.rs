@@ -1,0 +1,60 @@
+#[path = "bash.rs"]
+mod bash_impl;
+#[path = "edit.rs"]
+mod edit_impl;
+#[path = "read.rs"]
+mod read_impl;
+#[path = "write.rs"]
+mod write_impl;
+
+use e_agent_tool::{Deserialize, JsonSchema, Result, extension, tool};
+
+#[derive(Clone, Deserialize, JsonSchema, pyo3::FromPyObject)]
+#[pyo3(from_item_all)]
+struct Replacement {
+    /// Exact text to replace; it must occur exactly once in the original file.
+    old_text: String,
+    /// Text that replaces old_text.
+    new_text: String,
+}
+
+#[tool]
+/// Read a UTF-8 text file. Output is limited to 2000 lines or 50KB; use offset and limit to continue.
+async fn read(
+    #[desc("Path to the file to read, relative to the current directory or absolute")] path: String,
+    #[desc("1-based line number to start reading from")] offset: Option<usize>,
+    #[desc("Maximum number of lines to return")] limit: Option<usize>,
+) -> Result<String> {
+    read_impl::run(path, offset, limit).await
+}
+
+#[tool]
+/// Write a UTF-8 text file, creating parent directories and overwriting an existing file.
+async fn write(
+    #[desc("Path to the file to write, relative to the current directory or absolute")]
+    path: String,
+    #[desc("Complete content to write")] content: String,
+) -> Result<String> {
+    write_impl::run(path, content).await
+}
+
+#[tool]
+/// Edit one text file using exact, unique, non-overlapping replacements matched against the original content.
+async fn edit(
+    #[desc("Path to the file to edit, relative to the current directory or absolute")] path: String,
+    #[desc("One or more exact replacements; each old_text must be unique in the original file")]
+    edits: Vec<Replacement>,
+) -> Result<String> {
+    edit_impl::run(path, edits).await
+}
+
+#[tool]
+/// Execute a Git Bash command in the current working directory and return stdout and stderr.
+async fn bash(
+    #[desc("Bash command to execute")] command: String,
+    #[desc("Positive timeout in seconds; omitted means no timeout")] timeout: Option<f64>,
+) -> Result<String> {
+    bash_impl::run(command, timeout).await
+}
+
+extension!(basic_tools, [read, write, edit, bash]);

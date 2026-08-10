@@ -80,7 +80,7 @@ async fn f() -> error::Result<()> {
             .into(),
         ),
         ChatCompletionRequestMessage::User(
-            "你好，请帮我查询一下今天北京的天气，然后根据天气推荐一个合适的旅游景点。".into(),
+            "请使用 basic_tools 包完成以下任务：读取 Cargo.toml；根据读取结果写入 target/e-agent-tool-acceptance.txt，内容必须包含 workspace 成员数量和状态 DRAFT；使用 edit 将 DRAFT 改为 COMPLETE；最后使用 bash 的 grep 命令验证 COMPLETE 已写入。必须实际调用 read、write、edit、bash 四个函数，然后简要报告结果。".into(),
         ),
     ];
 
@@ -284,7 +284,9 @@ fn python_tool() -> error::Result<ChatCompletionTools> {
                  directly instead of printing them for another round. Tool outputs are JSON-compatible \
                  Python values; JSON Schema objects are dicts, so access fields with result[\"field\"], \
                  not attributes. Import the listed tool package explicitly, use asyncio.run(...) for \
-                 async functions, and print only the final useful values.",
+                 async functions, and print only the final useful values. Call package functions with \
+                 normal Python keyword arguments such as fn(path=\"file\"), not by passing one dict \
+                 positional argument.",
             )
             .parameters(serde_json::json!({
                 "type": "object",
