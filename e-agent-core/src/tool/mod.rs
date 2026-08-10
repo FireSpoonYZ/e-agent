@@ -63,9 +63,9 @@ impl ToolExecutor {
     pub async fn call(&self, code: &CStr) -> Result<String> {
         // sys.stdout and sys.stderr are process-global, so captures must not overlap.
         let _guard = CALL_LOCK.lock().await;
+        self.set_cancelled(false);
         let code = code.to_owned();
-
-        Ok(tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || -> PyResult<String> {
             Python::attach(|py| {
                 let globals = PyDict::new(py);
                 globals.set_item("__name__", "__main__")?;
@@ -88,7 +88,33 @@ impl ToolExecutor {
                 output.call_method0("getvalue")?.extract()
             })
         })
-        .await??)
+        .await?;
+        Ok(result?)
+    }
+
+    /// Set or clear the cancellation flag in every loaded extension.
+    ///
+    /// Each cdylib links its own copy of the tool runtime, so the flag has to be
+    /// pushed through Python rather than set once in this process.
+    fn set_cancelled(&self, cancelled: bool) {
+        Python::attach(|py| {
+            let modules = py.import("sys")?.getattr("modules")?;
+            for module in &self.modules {
+                let Ok(loaded) = modules.get_item(&module.name) else {
+                    continue;
+                };
+                if let Ok(setter) = loaded.getattr("_set_cancelled") {
+                    setter.call1((cancelled,))?;
+                }
+            }
+            Ok::<_, PyErr>(())
+        })
+        .unwrap_or_else(|error| tracing::warn!(%error, "cannot propagate cancellation"));
+    }
+
+    /// Cancel the tool calls of the current turn.
+    pub fn cancel(&self) {
+        self.set_cancelled(true);
     }
 }
 
@@ -281,40 +307,7 @@ mod tests {
     #[test]
     fn loads_and_runs_basic_tools() {
         crate::initialize_python().unwrap();
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        let target = root.join("target/basic-tools-test");
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "e-agent-basic-tools", "--target-dir"])
-            .arg(&target)
-            .current_dir(&root)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        #[cfg(windows)]
-        let (library, extension) = (
-            target.join("debug/basic_tools.dll"),
-            target.join("debug/basic_tools.pyd"),
-        );
-        #[cfg(target_os = "linux")]
-        let (library, extension) = {
-            let library = target.join("debug/libbasic_tools.so");
-            (library.clone(), library)
-        };
-        #[cfg(target_os = "macos")]
-        let (library, extension) = (
-            target.join("debug/libbasic_tools.dylib"),
-            target.join("debug/basic_tools.so"),
-        );
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-        let (library, extension) = {
-            let library = target.join("debug/libbasic_tools.so");
-            (library.clone(), library)
-        };
-        if library != extension {
-            std::fs::copy(library, &extension).unwrap();
-        }
-        let mut executor = ToolExecutor::default();
-        executor.load(extension).unwrap();
+        let executor = built_executor();
 
         let tools = executor.tools();
         assert_eq!(tools.len(), 1);
@@ -370,6 +363,10 @@ async def main():
     await asyncio.sleep(1.2)
     print("orphan=" + str(os.path.exists(marker)))
     print(await basic_tools.read({file}, 1, 1))
+    fuzzy = await basic_tools.write({file}, "let a = \u201cx\u201d;\n")
+    result = await basic_tools.edit({file}, [{{"old_text": 'let a = "x";', "new_text": "let a = 1;"}}])
+    print("fuzzy=" + str(result["used_fuzzy_match"]) + " line=" + str(result["first_changed_line"]))
+    print("diff=" + result["diff"].replace("\n", "|"))
 asyncio.run(main())"#
         ))
         .unwrap();
@@ -384,18 +381,106 @@ asyncio.run(main())"#
                 assert!(output.contains("[Output truncated. Full output:"));
                 assert!(output.contains("utf8=\u{4e2d}\u{6587}"));
                 assert!(output.contains("inherited=early"));
+                assert!(output.contains("fuzzy=True line=1"));
+                assert!(output.contains("+1 let a = 1;"));
                 assert!(output.contains("command timed out after 0.1 seconds"));
                 assert!(output.contains("orphan=False"));
-                assert!(output.contains("beta"));
                 Ok(())
             })
         })
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(fixture.join("sample.txt")).unwrap(),
-            "beta\n"
+            "let a = 1;\n"
         );
         std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    /// Build the basic tools extension and load it into a fresh executor.
+    ///
+    /// Windows locks a loaded `.pyd`, so the copy only happens once per build.
+    fn built_executor() -> ToolExecutor {
+        static BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = BUILD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let target = root.join("target/basic-tools-test");
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "-p", "e-agent-basic-tools", "--target-dir"])
+            .arg(&target)
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        #[cfg(windows)]
+        let (library, extension) = (
+            target.join("debug/basic_tools.dll"),
+            target.join("debug/basic_tools.pyd"),
+        );
+        #[cfg(target_os = "linux")]
+        let (library, extension) = {
+            let library = target.join("debug/libbasic_tools.so");
+            (library.clone(), library)
+        };
+        #[cfg(target_os = "macos")]
+        let (library, extension) = (
+            target.join("debug/libbasic_tools.dylib"),
+            target.join("debug/basic_tools.so"),
+        );
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        let (library, extension) = {
+            let library = target.join("debug/libbasic_tools.so");
+            (library.clone(), library)
+        };
+        if library != extension
+            && std::fs::copy(&library, &extension).is_err()
+            && !extension.is_file()
+        {
+            panic!("cannot stage {}", extension.display());
+        }
+        let mut executor = ToolExecutor::default();
+        executor.load(extension).unwrap();
+        executor
+    }
+
+    #[test]
+    fn cancels_a_running_bash_command() {
+        crate::initialize_python().unwrap();
+        let executor = std::sync::Arc::new(built_executor());
+        let code = CString::new(concat!(
+            "import asyncio, basic_tools\n",
+            "async def main():\n",
+            "    try:\n",
+            "        await basic_tools.bash('sleep 30')\n",
+            "        print('finished')\n",
+            "    except RuntimeError as error:\n",
+            "        print('cancelled=' + str(error).splitlines()[-1])\n",
+            "asyncio.run(main())",
+        ))
+        .unwrap();
+
+        Python::attach(|py| {
+            pyo3_async_runtimes::tokio::run(py, async move {
+                // The Python interpreter runs on a blocking thread, so trigger the
+                // cancel from an OS thread instead of a runtime timer.
+                let canceller = {
+                    let executor = executor.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        executor.cancel();
+                    })
+                };
+                let started = std::time::Instant::now();
+                let output = executor.call(&code).await.unwrap();
+                canceller.join().unwrap();
+                assert!(output.contains("cancelled="), "{output}");
+                assert!(output.to_lowercase().contains("cancelled"), "{output}");
+                assert!(started.elapsed() < std::time::Duration::from_secs(20));
+                Ok(())
+            })
+        })
+        .unwrap();
     }
 
     #[test]

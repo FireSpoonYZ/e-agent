@@ -1,7 +1,11 @@
 #[path = "bash.rs"]
 mod bash_impl;
+#[path = "diff.rs"]
+mod diff;
 #[path = "edit.rs"]
 mod edit_impl;
+#[path = "fuzzy.rs"]
+mod fuzzy;
 #[path = "mutation.rs"]
 mod mutation;
 #[path = "read.rs"]
@@ -42,12 +46,12 @@ async fn write(
 }
 
 #[tool]
-/// Edit one text file using exact, unique, non-overlapping replacements matched against the original content.
+/// Edit one text file using exact, unique, non-overlapping replacements matched against the original content. Returns a diff and unified patch.
 async fn edit(
     #[desc("Path to the file to edit, relative to the current directory or absolute")] path: String,
     #[desc("One or more exact replacements; each old_text must be unique in the original file")]
     edits: Vec<Replacement>,
-) -> Result<String> {
+) -> Result<Value> {
     edit_impl::run(path, edits).await
 }
 

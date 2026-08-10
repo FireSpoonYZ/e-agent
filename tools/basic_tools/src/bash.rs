@@ -65,21 +65,25 @@ pub async fn run(command: String, timeout: Option<f64>) -> Result<String> {
     let capture_task = tokio::spawn(capture(receiver));
 
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = match timeout {
         Some(seconds) => {
-            match tokio::time::timeout(Duration::from_secs_f64(seconds), child.wait()).await {
+            match tokio::time::timeout(Duration::from_secs_f64(seconds), wait(&mut child)).await {
                 Ok(status) => status?,
                 Err(_) => {
                     timed_out = true;
-                    if let Some(pid) = pid {
-                        terminate_process_tree(pid).await;
-                    }
-                    let _ = child.kill().await;
-                    child.wait().await?
+                    stop(&mut child, pid).await?
                 }
             }
         }
-        None => child.wait().await?,
+        None => match wait(&mut child).await {
+            Ok(status) => status,
+            Err(error) if error.is::<e_agent_tool::Cancelled>() => {
+                cancelled = true;
+                stop(&mut child, pid).await?
+            }
+            Err(error) => return Err(error),
+        },
     };
 
     // A descendant can outlive the shell while holding the pipes, so stop reading
@@ -94,6 +98,13 @@ pub async fn run(command: String, timeout: Option<f64>) -> Result<String> {
             rendered,
             separator(&rendered),
             timeout.unwrap()
+        ));
+    }
+    if cancelled {
+        return Err(anyhow!(
+            "{}{}command cancelled",
+            rendered,
+            separator(&rendered)
         ));
     }
     if !status.success() {
@@ -115,6 +126,31 @@ pub async fn run(command: String, timeout: Option<f64>) -> Result<String> {
 
 fn separator(output: &str) -> &'static str {
     if output.is_empty() { "" } else { "\n\n" }
+}
+
+/// Wait for the shell, aborting early when the host cancels the turn.
+async fn wait(child: &mut tokio::process::Child) -> Result<std::process::ExitStatus> {
+    if e_agent_tool::cancelled() {
+        return Err(e_agent_tool::Cancelled.into());
+    }
+    let mut signal = e_agent_tool::subscribe_cancel();
+    tokio::select! {
+        biased;
+        status = child.wait() => Ok(status?),
+        _ = signal.recv() => Err(e_agent_tool::Cancelled.into()),
+    }
+}
+
+/// Kill the shell and its descendants, then reap it.
+async fn stop(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+) -> Result<std::process::ExitStatus> {
+    if let Some(pid) = pid {
+        terminate_process_tree(pid).await;
+    }
+    let _ = child.kill().await;
+    Ok(child.wait().await?)
 }
 
 /// Await a pump task, treating a deliberate abort and a closed pipe as success.

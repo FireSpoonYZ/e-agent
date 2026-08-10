@@ -160,13 +160,15 @@ async fn f() -> error::Result<()> {
                                     "executing Python code"
                                 );
                                 match CString::new(args.code) {
-                                    Ok(code) => match tool_executor.call(code.as_c_str()).await {
-                                        Ok(output) if output.is_empty() => {
-                                            "(no output)".to_string()
+                                    Ok(code) => {
+                                        match run_tool(&tool_executor, code.as_c_str()).await {
+                                            Ok(output) if output.is_empty() => {
+                                                "(no output)".to_string()
+                                            }
+                                            Ok(output) => output,
+                                            Err(err) => format!("error: {err:#}"),
                                         }
-                                        Ok(output) => output,
-                                        Err(err) => format!("error: {err:#}"),
-                                    },
+                                    }
                                     Err(err) => format!("error: {err}"),
                                 }
                             }
@@ -211,6 +213,22 @@ async fn f() -> error::Result<()> {
     }
 
     unreachable!()
+}
+
+/// Run Python tool code, cancelling the in-flight tools on Ctrl-C.
+async fn run_tool(executor: &tool::ToolExecutor, code: &std::ffi::CStr) -> anyhow::Result<String> {
+    let call = executor.call(code);
+    tokio::pin!(call);
+    loop {
+        tokio::select! {
+            result = &mut call => return result,
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                warn!("cancelling tools after Ctrl-C");
+                executor.cancel();
+            }
+        }
+    }
 }
 
 fn module_config(variable: &str) -> error::Result<ModuleConfig> {
