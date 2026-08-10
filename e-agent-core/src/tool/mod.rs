@@ -272,20 +272,49 @@ fn doc(value: &Bound<'_, PyAny>) -> PyResult<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::CString, path::PathBuf};
+    use std::{ffi::CString, path::PathBuf, process::Command};
 
     use pyo3::prelude::*;
 
     use super::ToolExecutor;
 
     #[test]
-    #[ignore = "run after powershell -File scripts/build-basic-tools.ps1"]
     fn loads_and_runs_basic_tools() {
         crate::initialize_python().unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        let path = root.join("target/debug/basic_tools.pyd");
+        let target = root.join("target/basic-tools-test");
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "-p", "e-agent-basic-tools", "--target-dir"])
+            .arg(&target)
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        #[cfg(windows)]
+        let (library, extension) = (
+            target.join("debug/basic_tools.dll"),
+            target.join("debug/basic_tools.pyd"),
+        );
+        #[cfg(target_os = "linux")]
+        let (library, extension) = {
+            let library = target.join("debug/libbasic_tools.so");
+            (library.clone(), library)
+        };
+        #[cfg(target_os = "macos")]
+        let (library, extension) = (
+            target.join("debug/libbasic_tools.dylib"),
+            target.join("debug/basic_tools.so"),
+        );
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        let (library, extension) = {
+            let library = target.join("debug/libbasic_tools.so");
+            (library.clone(), library)
+        };
+        if library != extension {
+            std::fs::copy(library, &extension).unwrap();
+        }
         let mut executor = ToolExecutor::default();
-        executor.load(path).unwrap();
+        executor.load(extension).unwrap();
 
         let tools = executor.tools();
         assert_eq!(tools.len(), 1);
@@ -310,15 +339,33 @@ mod tests {
         let fixture =
             std::env::temp_dir().join(format!("e-agent-basic-tools-test-{}", std::process::id()));
         std::fs::create_dir_all(&fixture).unwrap();
-        let file = fixture.join("sample.txt");
-        let file = serde_json::to_string(&file.to_string_lossy()).unwrap();
+        let file_path = fixture.join("sample.txt");
+        let image_path = fixture.join("sample.png");
+        let marker_path = fixture.join("orphan.txt");
+        std::fs::write(&image_path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let file = serde_json::to_string(&file_path.to_string_lossy().replace('\\', "/")).unwrap();
+        let image =
+            serde_json::to_string(&image_path.to_string_lossy().replace('\\', "/")).unwrap();
+        let marker =
+            serde_json::to_string(&marker_path.to_string_lossy().replace('\\', "/")).unwrap();
         let code = CString::new(format!(
-            r#"import asyncio, basic_tools
+            r#"import asyncio, os, basic_tools
 async def main():
+    marker = {marker}
     print(await basic_tools.write({file}, "alpha\n"))
     print(await basic_tools.read({file}))
     print(await basic_tools.edit({file}, [{{"old_text": "alpha", "new_text": "beta"}}]))
-    print(await basic_tools.bash("printf tool-ok"))
+    ordered = await basic_tools.bash("printf 'out-1\\n'; sleep 0.1; printf 'err-1\\n' >&2; sleep 0.1; printf 'out-2\\n'")
+    print("ordered=" + ordered)
+    image = await basic_tools.read({image})
+    print("image=" + image["mime_type"] + ":" + image["data"][:4])
+    print(await basic_tools.bash("for i in $(seq 1 2100); do echo $i; done"))
+    try:
+        await basic_tools.bash(f"(sleep 1; printf orphan > '{{marker}}') & wait", timeout=0.1)
+    except RuntimeError as error:
+        print("timeout=" + str(error).splitlines()[-1])
+    await asyncio.sleep(1.2)
+    print("orphan=" + str(os.path.exists(marker)))
     print(await basic_tools.read({file}, 1, 1))
 asyncio.run(main())"#
         ))
@@ -329,7 +376,11 @@ asyncio.run(main())"#
                 let output = executor.call(&code).await.unwrap();
                 assert!(output.contains("Successfully wrote"));
                 assert!(output.contains("Successfully replaced"));
-                assert!(output.contains("tool-ok"));
+                assert!(output.contains("ordered=out-1\nerr-1\nout-2"));
+                assert!(output.contains("image=image/png:iVBO"));
+                assert!(output.contains("[Output truncated. Full output:"));
+                assert!(output.contains("command timed out after 0.1 seconds"));
+                assert!(output.contains("orphan=False"));
                 assert!(output.contains("beta"));
                 Ok(())
             })

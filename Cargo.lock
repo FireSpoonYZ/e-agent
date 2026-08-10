@@ -316,10 +316,13 @@ dependencies = [
 name = "e-agent-basic-tools"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "e-agent-tool",
+ "libc",
  "pyo3",
  "schemars",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

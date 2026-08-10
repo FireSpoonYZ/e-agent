@@ -2,12 +2,15 @@
 mod bash_impl;
 #[path = "edit.rs"]
 mod edit_impl;
+#[path = "mutation.rs"]
+mod mutation;
 #[path = "read.rs"]
 mod read_impl;
 #[path = "write.rs"]
 mod write_impl;
 
 use e_agent_tool::{Deserialize, JsonSchema, Result, extension, tool};
+use serde_json::Value;
 
 #[derive(Clone, Deserialize, JsonSchema, pyo3::FromPyObject)]
 #[pyo3(from_item_all)]
@@ -19,12 +22,12 @@ struct Replacement {
 }
 
 #[tool]
-/// Read a UTF-8 text file. Output is limited to 2000 lines or 50KB; use offset and limit to continue.
+/// Read a text file or an image (jpg, png, gif, webp, bmp). Text is limited to 2000 lines or 50KB.
 async fn read(
     #[desc("Path to the file to read, relative to the current directory or absolute")] path: String,
     #[desc("1-based line number to start reading from")] offset: Option<usize>,
     #[desc("Maximum number of lines to return")] limit: Option<usize>,
-) -> Result<String> {
+) -> Result<Value> {
     read_impl::run(path, offset, limit).await
 }
 
