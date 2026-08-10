@@ -1,0 +1,21 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$Executable,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Arguments
+)
+
+$envFile = Join-Path $PSScriptRoot "..\.env"
+$line = Get-Content $envFile | Where-Object { $_ -match '^PYTHON_HOME=' } | Select-Object -First 1
+if (-not $line) {
+    Write-Error "PYTHON_HOME is not set in $envFile"
+    exit 1
+}
+
+$pythonHome = $line.Substring('PYTHON_HOME='.Length).Trim()
+$env:PYTHON_HOME = $pythonHome
+$env:PYTHONHOME = $pythonHome
+$env:PATH = "$pythonHome;$env:PATH"
+
+& $Executable @Arguments
+exit $LASTEXITCODE

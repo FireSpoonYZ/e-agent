@@ -1,0 +1,7 @@
+/target
+/DLLs
+/Lib
+/python314.dll
+__pycache__/
+*.pyc
+.env
