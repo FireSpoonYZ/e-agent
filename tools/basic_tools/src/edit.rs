@@ -46,9 +46,14 @@ pub async fn run(path: String, edits: Vec<Replacement>) -> Result<String> {
             }
         }
 
-        let mut result = normalized;
+        let mut result = normalized.clone();
         for (start, end, replacement) in ranges.into_iter().rev() {
             result.replace_range(start..end, &replacement);
+        }
+        if result == normalized {
+            return Err(anyhow!(
+                "No changes made to {display_path}. The replacements produced identical content."
+            ));
         }
         if line_ending == "\r\n" {
             result = result.replace('\n', "\r\n");
@@ -113,6 +118,21 @@ mod tests {
                 }],
             ))
             .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\nchanged\n");
+
+        let identical = runtime.block_on(run(
+            path.to_string_lossy().into_owned(),
+            vec![Replacement {
+                old_text: "changed".to_string(),
+                new_text: "changed".to_string(),
+            }],
+        ));
+        assert!(
+            identical
+                .unwrap_err()
+                .to_string()
+                .contains("No changes made")
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\nchanged\n");
         std::fs::remove_file(path).unwrap();
     }

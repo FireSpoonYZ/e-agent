@@ -2,7 +2,10 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -15,9 +18,13 @@ use tokio::{
     sync::mpsc,
 };
 
+use crate::mutation;
+
 const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
 const MAX_TIMEOUT_SECONDS: f64 = 2_147_483_647.0 / 1_000.0;
+/// Idle window granted to inherited pipes after the shell exits.
+const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 static OUTPUT_ID: AtomicU64 = AtomicU64::new(0);
 
 pub async fn run(command: String, timeout: Option<f64>) -> Result<String> {
@@ -33,7 +40,7 @@ pub async fn run(command: String, timeout: Option<f64>) -> Result<String> {
     let mut command_process = Command::new(shell);
     command_process
         .args(["--noprofile", "--norc", "-c", &command])
-        .current_dir(std::env::current_dir()?)
+        .current_dir(mutation::base_dir()?)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -51,8 +58,9 @@ pub async fn run(command: String, timeout: Option<f64>) -> Result<String> {
         .take()
         .ok_or_else(|| anyhow!("capture stderr"))?;
     let (sender, receiver) = mpsc::channel(16);
-    let stdout_task = tokio::spawn(pump(stdout, sender.clone()));
-    let stderr_task = tokio::spawn(pump(stderr, sender.clone()));
+    let written = Arc::new(AtomicUsize::new(0));
+    let stdout_task = tokio::spawn(pump(stdout, sender.clone(), written.clone()));
+    let stderr_task = tokio::spawn(pump(stderr, sender.clone(), written.clone()));
     drop(sender);
     let capture_task = tokio::spawn(capture(receiver));
 
@@ -74,8 +82,11 @@ pub async fn run(command: String, timeout: Option<f64>) -> Result<String> {
         None => child.wait().await?,
     };
 
-    stdout_task.await??;
-    stderr_task.await??;
+    // A descendant can outlive the shell while holding the pipes, so stop reading
+    // once they fall idle instead of waiting for EOF forever.
+    drain(&stdout_task, &stderr_task, &written).await;
+    join(stdout_task).await?;
+    join(stderr_task).await?;
     let rendered = capture_task.await??;
     if timed_out {
         return Err(anyhow!(
@@ -106,13 +117,43 @@ fn separator(output: &str) -> &'static str {
     if output.is_empty() { "" } else { "\n\n" }
 }
 
-async fn pump(mut reader: impl AsyncRead + Unpin, sender: mpsc::Sender<Vec<u8>>) -> Result<()> {
+/// Await a pump task, treating a deliberate abort and a closed pipe as success.
+async fn join(task: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    match task.await {
+        Ok(result) => result.or(Ok(())),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn drain<T>(
+    stdout_task: &tokio::task::JoinHandle<T>,
+    stderr_task: &tokio::task::JoinHandle<T>,
+    written: &AtomicUsize,
+) {
+    while !(stdout_task.is_finished() && stderr_task.is_finished()) {
+        let before = written.load(Ordering::Relaxed);
+        tokio::time::sleep(EXIT_STDIO_GRACE).await;
+        if written.load(Ordering::Relaxed) == before {
+            stdout_task.abort();
+            stderr_task.abort();
+            return;
+        }
+    }
+}
+
+async fn pump(
+    mut reader: impl AsyncRead + Unpin,
+    sender: mpsc::Sender<Vec<u8>>,
+    written: Arc<AtomicUsize>,
+) -> Result<()> {
     let mut buffer = vec![0; 8 * 1024];
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
             return Ok(());
         }
+        written.fetch_add(read, Ordering::Relaxed);
         if sender.send(buffer[..read].to_vec()).await.is_err() {
             return Ok(());
         }
@@ -146,11 +187,13 @@ async fn capture(mut receiver: mpsc::Receiver<Vec<u8>>) -> Result<String> {
 
     let total_lines = total_newlines + usize::from(total_bytes > 0 && last_byte != Some(b'\n'));
     let truncated = total_bytes > MAX_BYTES || total_lines > MAX_LINES;
-    let mut bytes: Vec<_> = tail.into();
-    if total_lines > MAX_LINES {
-        bytes = last_lines(&bytes, MAX_LINES).to_vec();
-    }
-    let mut output = String::from_utf8_lossy(&bytes).into_owned();
+    let tail = Vec::from(tail);
+    let bytes = if total_lines > MAX_LINES {
+        last_lines(&tail, MAX_LINES)
+    } else {
+        &tail
+    };
+    let mut output = String::from_utf8_lossy(utf8_tail(bytes)).into_owned();
     if truncated {
         output.push_str(&format!(
             "\n\n[Output truncated. Full output: {}]",
@@ -160,6 +203,19 @@ async fn capture(mut receiver: mpsc::Receiver<Vec<u8>>) -> Result<String> {
         tokio::fs::remove_file(path).await?;
     }
     Ok(output)
+}
+
+/// Drop a partial UTF-8 sequence left at the front by byte-oriented truncation.
+fn utf8_tail(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| byte & 0xC0 != 0x80)
+        .unwrap_or(bytes.len());
+    if start == 0 || std::str::from_utf8(bytes).is_ok() {
+        bytes
+    } else {
+        &bytes[start..]
+    }
 }
 
 fn last_lines(bytes: &[u8], limit: usize) -> &[u8] {
@@ -220,16 +276,14 @@ async fn find_git_bash() -> Result<PathBuf> {
         }
     }
 
-    if let Ok(output) = Command::new("where.exe").arg("bash").output().await {
-        if output.status.success() {
-            if let Some(path) = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::trim)
-                .find(|path| !path.is_empty() && Path::new(path).is_file())
-            {
-                return Ok(PathBuf::from(path));
-            }
-        }
+    if let Ok(output) = Command::new("where.exe").arg("bash").output().await
+        && output.status.success()
+        && let Some(path) = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|path| !path.is_empty() && Path::new(path).is_file())
+    {
+        return Ok(PathBuf::from(path));
     }
     Err(anyhow!("Git Bash was not found; tried: {attempted:?}"))
 }
@@ -252,12 +306,20 @@ async fn find_git_bash() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::last_lines;
+    use super::{last_lines, utf8_tail};
 
     #[test]
     fn keeps_requested_tail_lines() {
         assert_eq!(last_lines(b"one\ntwo\nthree\n", 2), b"two\nthree\n");
         assert_eq!(last_lines(b"one\ntwo\nthree", 2), b"two\nthree");
         assert_eq!(last_lines(b"one\ntwo", 2), b"one\ntwo");
+    }
+
+    #[test]
+    fn drops_partial_utf8_prefix() {
+        let text = "中文".as_bytes();
+        assert_eq!(utf8_tail(&text[1..]), &text[3..]);
+        assert_eq!(utf8_tail(text), text);
+        assert_eq!(utf8_tail(b"ascii"), b"ascii");
     }
 }

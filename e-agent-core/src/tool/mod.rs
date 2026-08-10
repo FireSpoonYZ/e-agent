@@ -360,6 +360,9 @@ async def main():
     image = await basic_tools.read({image})
     print("image=" + image["mime_type"] + ":" + image["data"][:4])
     print(await basic_tools.bash("for i in $(seq 1 2100); do echo $i; done"))
+    print("utf8=" + (await basic_tools.bash("printf '中文\\n'"))[:2])
+    inherited = await basic_tools.bash("(sleep 5; echo late) & echo early", timeout=10)
+    print("inherited=" + inherited.strip())
     try:
         await basic_tools.bash(f"(sleep 1; printf orphan > '{{marker}}') & wait", timeout=0.1)
     except RuntimeError as error:
@@ -379,6 +382,8 @@ asyncio.run(main())"#
                 assert!(output.contains("ordered=out-1\nerr-1\nout-2"));
                 assert!(output.contains("image=image/png:iVBO"));
                 assert!(output.contains("[Output truncated. Full output:"));
+                assert!(output.contains("utf8=\u{4e2d}\u{6587}"));
+                assert!(output.contains("inherited=early"));
                 assert!(output.contains("command timed out after 0.1 seconds"));
                 assert!(output.contains("orphan=False"));
                 assert!(output.contains("beta"));

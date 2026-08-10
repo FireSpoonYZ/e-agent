@@ -2,11 +2,13 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use e_agent_tool::{Result, anyhow};
 use serde_json::{Value, json};
 
+use crate::mutation;
+
 const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
 
 pub async fn run(path: String, offset: Option<usize>, limit: Option<usize>) -> Result<Value> {
-    let bytes = tokio::fs::read(&path).await?;
+    let bytes = tokio::fs::read(mutation::resolve(&path)?).await?;
     if let Some(mime_type) = image_mime_type(&bytes) {
         return Ok(json!({
             "type": "image",
