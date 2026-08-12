@@ -1,14 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub fn new_user_message(text: impl ToString) -> Message {
-    Message::User(UserMessage {
-        content: vec![MessageContent::Text {
-            text: text.to_string(),
-        }],
-    })
-}
-
 /// One entry in the conversation history.
 ///
 /// The role is the variant rather than a field so that role-specific data has a
@@ -204,7 +196,7 @@ mod tests {
     #[test]
     fn round_trips_a_tool_call_and_its_result() {
         let history = vec![
-            new_user_message("run it"),
+            Message::User(UserMessage::text("run it")),
             Message::Assistant(AssistantMessage {
                 content: vec![
                     MessageContent::Thinking {

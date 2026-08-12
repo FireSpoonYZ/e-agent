@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn flattens_text_tool_calls_and_results_in_order() {
         let messages = vec![
-            crate::message::new_user_message("hi"),
+            Message::User(crate::message::UserMessage::text("hi")),
             Message::Assistant(AssistantMessage {
                 content: vec![
                     MessageContent::Thinking {

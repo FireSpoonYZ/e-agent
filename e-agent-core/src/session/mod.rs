@@ -1,5 +1,3 @@
-mod error;
-
 use anyhow::Result;
 
 use crate::{
