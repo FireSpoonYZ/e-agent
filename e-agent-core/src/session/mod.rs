@@ -77,7 +77,7 @@ impl<P: Provider, E: ToolExecutor> Session<P, E> {
                         custom,
                         ..
                     } => {
-                        println!("tool use({}): {}({:?})", id, name, input);
+                        println!("tool use: {}\n{}", name, input);
                         tc.push((id, name, input, custom));
                     }
                 }

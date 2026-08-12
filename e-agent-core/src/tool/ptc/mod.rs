@@ -32,17 +32,19 @@ impl ToolExecutor for ProgrammaticToolExecutor {
         vec![ToolDef {
             name: "python".into(),
             description: format!(
-                "Execute a complete Python script in a normal Python runtime. This is both a general-purpose \
-                 Python executor and the gateway to the registered tools: use ordinary Python, its standard \
-                 library, and available packages for computation, parsing, transformation, control flow, or \
-                 other suitable work; import the listed tool packages to call ToolExecutor-registered functions. \
-                 Combine both capabilities in one script whenever possible, chaining dependent operations and \
-                 passing intermediate values directly instead of printing them for another round. Registered \
-                 async functions must be awaited, typically via asyncio.run(...). Their outputs are JSON-compatible \
+                "Run a complete Python script in a normal Python runtime. This is the single interface for both \
+                 general-purpose Python execution and all externally provided tools. You may use Python built-ins, \
+                 the standard library, and installed packages directly for tasks such as computation, parsing, data \
+                 transformation, control flow, network access, filesystem reads and writes, and other suitable work. \
+                 The externally provided tools are exposed as the Python modules and functions listed below; import \
+                 those modules when their specialized capabilities are useful. Prefer one coherent script that \
+                 combines ordinary Python with these tools, chains dependent operations, and keeps intermediate \
+                 values in memory instead of printing them merely to pass them into another tool call. Registered \
+                 async functions must be awaited, typically via asyncio.run(...). Tool results are JSON-compatible \
                  Python values; JSON Schema objects are dicts, so access fields with result[\"field\"], not \
-                 attributes. Call registered functions with normal Python keyword arguments such as \
-                 fn(path=\"file\"), not by passing one dict positional argument. Print only the final useful \
-                 result needed to answer the user.\nSupported packages: \n{}",
+                 attributes. Call tool functions with normal Python keyword arguments, for example \
+                 fn(path=\"file\"), rather than passing a single dict as a positional argument. Print only the \
+                 final useful result needed to answer the user.\nSupported tool packages:\n{}",
                 serde_json::to_string(&self.tools()).unwrap()
             ),
             input: ToolInput::Text,
