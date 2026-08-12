@@ -1,4 +1,5 @@
 use anyhow::Result;
+use e_agent_tool::SessionId;
 
 use crate::{
     message::{Message, ToolResultMessage, UserMessage},
@@ -7,6 +8,7 @@ use crate::{
 };
 
 pub struct Session<P: Provider, E: ToolExecutor> {
+    id: SessionId,
     system_prompt: String,
     messages: Vec<Message>,
     trun: usize,
@@ -17,6 +19,7 @@ pub struct Session<P: Provider, E: ToolExecutor> {
 impl<P: Provider, E: ToolExecutor> Session<P, E> {
     pub fn new(provider: P, tool_executor: E, system_prompt: impl ToString) -> Self {
         Self {
+            id: SessionId::next(),
             provider,
             tool_executor,
             system_prompt: system_prompt.to_string(),
@@ -25,13 +28,30 @@ impl<P: Provider, E: ToolExecutor> Session<P, E> {
         }
     }
 
+    pub fn id(&self) -> SessionId {
+        self.id
+    }
+
+    /// Release the per-session state held by every loaded extension.
+    pub async fn close(&mut self) -> Result<()> {
+        self.tool_executor
+            .drop_session(self.id)
+            .await
+            .map_err(|err| anyhow::anyhow!("drop session state failed: {err:?}"))
+    }
+
     pub fn build_system_prompt(&self) -> String {
-        format!(
+        let mut prompt = format!(
             "{}\n当前时间为:{}\n当前目录为:{}",
             self.system_prompt,
             chrono::Local::now(),
             std::env::current_dir().unwrap().display()
-        )
+        );
+        for extension_prompt in self.tool_executor.system_prompts() {
+            prompt.push('\n');
+            prompt.push_str(&extension_prompt);
+        }
+        prompt
     }
 
     pub async fn run_one_trun(&mut self, user_input: UserMessage) -> Result<()> {
@@ -87,7 +107,7 @@ impl<P: Provider, E: ToolExecutor> Session<P, E> {
             }
 
             for (id, name, input, custom) in tc.into_iter() {
-                let tool_result = match self.tool_executor.call(&name, input).await {
+                let tool_result = match self.tool_executor.call(self.id, &name, input).await {
                     Ok(output) => ToolResultMessage {
                         tool_use_id: id,
                         content: output.content,
@@ -109,5 +129,89 @@ impl<P: Provider, E: ToolExecutor> Session<P, E> {
             println!("================================");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use e_agent_tool::SessionId;
+
+    use super::Session;
+    use crate::{
+        message::{AssistantMessage, Context, ToolDef},
+        provider::Provider,
+        tool::{ToolExecutor, ToolOutput},
+    };
+
+    struct NoProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for NoProvider {
+        type Error = anyhow::Error;
+        async fn send(
+            &self,
+            _model: &str,
+            _context: Context<'_>,
+        ) -> Result<AssistantMessage, Self::Error> {
+            unimplemented!("prompt assembly does not call the provider")
+        }
+    }
+
+    /// Two extensions whose prompts must stay in load order.
+    struct TwoExtensions;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for TwoExtensions {
+        type Error = anyhow::Error;
+        fn tool_defs(&self) -> Vec<ToolDef> {
+            Vec::new()
+        }
+        fn system_prompts(&self) -> Vec<String> {
+            vec![
+                "first extension prompt".into(),
+                "second extension prompt".into(),
+            ]
+        }
+        async fn call(
+            &self,
+            _session: SessionId,
+            _name: &str,
+            _input: String,
+        ) -> Result<ToolOutput, Self::Error> {
+            unimplemented!("prompt assembly does not call tools")
+        }
+        async fn drop_session(&self, _session: SessionId) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Base prompt, runtime context, then extension prompts in load order.
+    #[test]
+    fn assembles_prompt_in_deterministic_order() {
+        let session = Session::new(NoProvider, TwoExtensions, "base prompt");
+        let prompt = session.build_system_prompt();
+        let lines: Vec<_> = prompt.lines().collect();
+
+        assert_eq!(lines[0], "base prompt");
+        assert!(lines[1].starts_with("当前时间为:"));
+        assert!(lines[2].starts_with("当前目录为:"));
+        assert_eq!(
+            &lines[3..],
+            ["first extension prompt", "second extension prompt"]
+        );
+    }
+
+    /// Every session gets its own identity, and closing one is not an error.
+    #[test]
+    fn assigns_unique_session_ids() {
+        let mut first = Session::new(NoProvider, TwoExtensions, "base");
+        let second = Session::new(NoProvider, TwoExtensions, "base");
+        assert_ne!(first.id(), second.id());
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(first.close())
+            .unwrap();
     }
 }

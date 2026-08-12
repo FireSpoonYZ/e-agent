@@ -1,17 +1,16 @@
-use e_agent_tool::{Context, JsonSchema, Result, Serialize, tool};
+use e_agent_tool::{Context, JsonSchema, Result, Serialize};
 use serde::Deserialize;
 
-#[tool]
 /// Search the web through the configured SearXNG instance.
-pub async fn web_search(
-    #[desc("Search query")] q: String,
-    #[desc("Comma-separated search categories")] categories: Option<String>,
-    #[desc("Result language code, such as zh-CN or en")] language: Option<String>,
-    #[desc("One-based result page number")] pageno: Option<u32>,
-    #[desc("Time range: day, month, or year")] time_range: Option<String>,
-    #[desc("Safe-search level: 0, 1, or 2")] safesearch: Option<u8>,
-    #[desc("Instance theme, normally simple")] theme: Option<String>,
-    #[desc("Controls the use of certificate validation.")] accept_invalid_certs: Option<bool>,
+pub async fn run(
+    q: String,
+    categories: Option<String>,
+    language: Option<String>,
+    pageno: Option<u32>,
+    time_range: Option<String>,
+    safesearch: Option<u8>,
+    theme: Option<String>,
+    accept_invalid_certs: Option<bool>,
 ) -> Result<SearxngSearchResponse> {
     let base_url = std::env::var("SEARXNG_BASE_URL").context("SEARXNG_BASE_URL is not set")?;
     let params = SearxngSearchParams {

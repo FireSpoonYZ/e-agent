@@ -1,14 +1,20 @@
 extern crate self as e_agent_tool;
 
 mod context;
+#[cfg(test)]
+mod macro_tests;
+mod state;
 
 use std::future::Future;
 
 pub use anyhow::{Context, Result, anyhow};
 pub use context::{Cancelled, cancel, cancelled, progress, reset, subscribe_cancel};
-pub use e_agent_macros::tool;
+pub use e_agent_macros::{extension, state, tool};
 pub use schemars::JsonSchema;
 pub use serde::{Deserialize, Serialize};
+pub use state::{
+    SessionId, SessionStates, clear_current_session, current_session, set_current_session,
+};
 
 use pyo3::prelude::*;
 use serde_json::Value;
@@ -30,10 +36,15 @@ pub struct ToolFunction {
     pub output_schema: Value,
 }
 
+/// Model-visible description of one loaded extension.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ToolModule {
+#[serde(rename_all = "camelCase")]
+pub struct ToolExtension {
     pub name: String,
     pub description: String,
+    /// Extra system-prompt text contributed by the extension. May be empty.
+    #[serde(default)]
+    pub system_prompt: String,
     pub functions: Vec<ToolFunction>,
 }
 
@@ -76,39 +87,4 @@ pub fn run<T: Tool>(py: Python, input: T::Input) -> PyResult<Py<PyAny>> {
         })
     })
     .map(Bound::unbind)
-}
-
-#[macro_export]
-macro_rules! extension {
-    ($name:ident, [$($tool:ident),* $(,)?]) => {
-        /// Set or clear the cancellation flag for this extension.
-        ///
-        /// A cdylib links its own copy of the tool runtime, so the host cannot
-        /// reach these statics directly and drives them through Python instead.
-        #[$crate::__private::pyo3::pyfunction]
-        #[pyo3(name = "_set_cancelled")]
-        pub fn __e_agent_set_cancelled(cancelled: bool) {
-            if cancelled {
-                $crate::cancel();
-            } else {
-                $crate::reset();
-            }
-        }
-
-        #[$crate::__private::pyo3::pymodule]
-        pub fn $name(
-            module: &$crate::__private::pyo3::Bound<'_, $crate::__private::pyo3::types::PyModule>
-        ) -> $crate::__private::pyo3::PyResult<()> {
-            use $crate::__private::pyo3::types::PyModuleMethods as _;
-
-            module.add_function($crate::__private::pyo3::wrap_pyfunction!(
-                __e_agent_set_cancelled, module)?)?;
-            $(module.add_function($crate::__private::pyo3::wrap_pyfunction!($tool::python, module)?)?;)*
-            let functions = vec![$($crate::tool_function::<$tool::Definition>()
-                .map_err(|err| $crate::__private::pyo3::exceptions::PyValueError::new_err(format!("{err:#}")))?),*];
-            let metadata = $crate::__private::serde_json::to_string(&functions)
-                .map_err(|err| $crate::__private::pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
-            module.add("__e_agent_tools__", metadata)
-        }
-    };
 }

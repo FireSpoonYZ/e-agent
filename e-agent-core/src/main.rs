@@ -33,6 +33,7 @@ async fn main() -> Result<()> {
     session
         .run_one_trun(UserMessage::text("commit一下代码"))
         .await?;
+    session.close().await?;
 
     Ok(())
 }

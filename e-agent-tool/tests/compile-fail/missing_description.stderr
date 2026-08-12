@@ -1,0 +1,5 @@
+error: #[extension] requires description = "..."
+ --> tests/compile-fail/missing_description.rs:4:5
+  |
+4 | mod broken {}
+  |     ^^^^^^

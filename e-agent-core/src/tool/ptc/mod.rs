@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, ffi::CString, path::Path};
 
 use anyhow::{Context, Result};
-use e_agent_tool::{ToolFunction, ToolModule};
+use e_agent_tool::{SessionId, ToolExtension, ToolFunction};
 use pyo3::{
     prelude::*,
     types::{PyDict, PyModule},
@@ -20,9 +20,18 @@ pub struct PTCOutput {
     stderr: String,
 }
 
+/// Serializes Python execution, which owns process-wide stdio and session state.
+static PYTHON: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// One loaded extension: its model-visible metadata and its Python module.
+struct LoadedExtension {
+    metadata: ToolExtension,
+    module: Py<PyModule>,
+}
+
 #[derive(Default)]
 pub struct ProgrammaticToolExecutor {
-    modules: Vec<ToolModule>,
+    extensions: Vec<LoadedExtension>,
 }
 
 #[async_trait::async_trait]
@@ -51,12 +60,39 @@ impl ToolExecutor for ProgrammaticToolExecutor {
         }]
     }
 
-    async fn call(&self, _name: &str, code: String) -> Result<ToolOutput, Self::Error> {
-        let output = self.execute(code).await?;
+    async fn call(
+        &self,
+        session: SessionId,
+        _name: &str,
+        code: String,
+    ) -> Result<ToolOutput, Self::Error> {
+        let output = self.execute(session, code).await?;
         let content = serde_json::to_string(&output).context("serialize ptc output failed")?;
         Ok(ToolOutput {
             content: vec![MessageContent::text(content)],
             details: None,
+        })
+    }
+
+    fn system_prompts(&self) -> Vec<String> {
+        self.extensions
+            .iter()
+            .map(|extension| extension.metadata.system_prompt.trim().to_string())
+            .filter(|prompt| !prompt.is_empty())
+            .collect()
+    }
+
+    async fn drop_session(&self, session: SessionId) -> Result<(), Self::Error> {
+        Python::attach(|py| {
+            for extension in &self.extensions {
+                let module = extension.module.bind(py);
+                if let Ok(drop) = module.getattr("__e_agent_drop_session__") {
+                    drop.call1((session.0,)).with_context(|| {
+                        format!("drop session in {} failed", extension.metadata.name)
+                    })?;
+                }
+            }
+            Ok(())
         })
     }
 }
@@ -67,51 +103,89 @@ impl ProgrammaticToolExecutor {
             .as_ref()
             .canonicalize()
             .with_context(|| format!("tool path does not exist: {}", path.as_ref().display()))?;
-        let (module, functions) = Python::attach(|py| {
+        let (module, metadata) = Python::attach(|py| {
             let module = load_module(py, &path)?;
-            let functions = metadata(module.bind(py))?;
-            Ok::<_, PyErr>((module, functions))
+            let metadata = metadata(module.bind(py))?;
+            Ok::<_, PyErr>((module, metadata))
         })?;
-        self.register(&module, functions)
+        self.register(module, metadata)
     }
 
-    pub fn register(&mut self, module: &Py<PyModule>, functions: Vec<ToolFunction>) -> Result<()> {
-        let tool_module = Python::attach(|py| {
-            let module = module.bind(py);
-            let name = module.name()?.to_string();
-            validate_module(module, &functions)?;
+    pub fn register(&mut self, module: Py<PyModule>, metadata: ToolExtension) -> Result<()> {
+        let metadata = Python::attach(|py| {
+            let bound = module.bind(py);
+            let name = bound.name()?.to_string();
+            validate_module(bound, &metadata.functions)?;
             py.import("sys")?
                 .getattr("modules")?
-                .set_item(&name, module)?;
-            Ok::<_, PyErr>(ToolModule {
-                name,
-                description: doc(module.as_any())?,
-                functions,
-            })
+                .set_item(&name, bound)?;
+            Ok::<_, PyErr>(ToolExtension { name, ..metadata })
         })?;
 
+        let loaded = LoadedExtension { metadata, module };
         if let Some(existing) = self
-            .modules
+            .extensions
             .iter_mut()
-            .find(|module| module.name == tool_module.name)
+            .find(|extension| extension.metadata.name == loaded.metadata.name)
         {
-            *existing = tool_module;
+            *existing = loaded;
         } else {
-            self.modules.push(tool_module);
+            self.extensions.push(loaded);
         }
         Ok(())
     }
 
-    pub fn tools(&self) -> Vec<ToolModule> {
-        self.modules.clone()
+    pub fn tools(&self) -> Vec<ToolExtension> {
+        self.extensions
+            .iter()
+            .map(|extension| extension.metadata.clone())
+            .collect()
     }
 
-    async fn execute(&self, code: impl Into<Vec<u8>>) -> Result<PTCOutput> {
+    /// Bind `session` in every loaded extension for the duration of one script.
+    fn bind_session(py: Python<'_>, extensions: &[&str], session: SessionId) -> PyResult<()> {
+        let modules = py.import("sys")?.getattr("modules")?;
+        for name in extensions {
+            let module = modules.get_item(name)?;
+            if let Ok(bind) = module.getattr("__e_agent_set_session__") {
+                bind.call1((session.0,))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn unbind_session(py: Python<'_>, extensions: &[&str]) {
+        let Ok(modules) = py.import("sys").and_then(|sys| sys.getattr("modules")) else {
+            return;
+        };
+        for name in extensions {
+            if let Ok(module) = modules.get_item(name)
+                && let Ok(clear) = module.getattr("__e_agent_clear_session__")
+            {
+                let _ = clear.call0();
+            }
+        }
+    }
+
+    async fn execute(&self, session: SessionId, code: impl Into<Vec<u8>>) -> Result<PTCOutput> {
         let code =
             CString::new(code).context("python code raw bytes contains an internal 0 byte")?;
+        let names: Vec<String> = self
+            .extensions
+            .iter()
+            .map(|extension| extension.metadata.name.clone())
+            .collect();
+        // Output capture and the hidden current-session slot are both process
+        // wide, so only one script may run at a time.
+        //
+        // ponytail: one global lock across every executor and session, which the
+        // shared interpreter already implies; revisit if independent sessions
+        // ever need concurrent Python execution.
+        let _guard = PYTHON.lock().await;
         let (stdout, stderr) =
             tokio::task::spawn_blocking(move || -> PyResult<(String, String)> {
                 Python::attach(|py| {
+                    let names: Vec<&str> = names.iter().map(String::as_str).collect();
                     let globals = PyDict::new(py);
                     globals.set_item("__name__", "__main__")?;
                     globals.set_item("__file__", "<tool>")?;
@@ -124,7 +198,10 @@ impl ProgrammaticToolExecutor {
                     sys.setattr("stdout", &stdout)?;
                     sys.setattr("stderr", &stderr)?;
 
-                    let run_result = py.run(code.as_c_str(), Some(&globals), Some(&globals));
+                    let bind_result = Self::bind_session(py, &names, session);
+                    let run_result = bind_result
+                        .and_then(|()| py.run(code.as_c_str(), Some(&globals), Some(&globals)));
+                    Self::unbind_session(py, &names);
                     let restore_stdout = sys.setattr("stdout", origin_stdout);
                     let restore_stderr = sys.setattr("stderr", origin_stderr);
 
@@ -221,11 +298,11 @@ fn module_name(path: &Path) -> PyResult<String> {
     Ok(name.to_string())
 }
 
-fn metadata(module: &Bound<'_, PyModule>) -> PyResult<Vec<ToolFunction>> {
+fn metadata(module: &Bound<'_, PyModule>) -> PyResult<ToolExtension> {
     let name = module.name()?.to_string();
-    let value = module.getattr("__e_agent_tools__").map_err(|_| {
+    let value = module.getattr("__e_agent_extension__").map_err(|_| {
         pyo3::exceptions::PyImportError::new_err(format!(
-            "{name} does not define __e_agent_tools__"
+            "{name} does not define __e_agent_extension__"
         ))
     })?;
     let json = match value.extract::<String>() {
@@ -236,9 +313,26 @@ fn metadata(module: &Bound<'_, PyModule>) -> PyResult<Vec<ToolFunction>> {
             .call_method1("dumps", (value,))?
             .extract()?,
     };
-    serde_json::from_str(&json).map_err(|error| {
-        pyo3::exceptions::PyValueError::new_err(format!("invalid __e_agent_tools__: {error}"))
-    })
+    let extension: ToolExtension = serde_json::from_str(&json).map_err(|error| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid __e_agent_extension__ in {name}: {error}"
+        ))
+    })?;
+    if extension.description.trim().is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{name} extension description is empty"
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for function in &extension.functions {
+        if !seen.insert(function.name.as_str()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{name} declares duplicate tool {}",
+                function.name
+            )));
+        }
+    }
+    Ok(extension)
 }
 
 fn validate_module(module: &Bound<'_, PyModule>, functions: &[ToolFunction]) -> PyResult<()> {
@@ -315,19 +409,11 @@ fn validate_module(module: &Bound<'_, PyModule>, functions: &[ToolFunction]) -> 
     Ok(())
 }
 
-fn doc(value: &Bound<'_, PyAny>) -> PyResult<String> {
-    Ok(value
-        .getattr("__doc__")?
-        .extract::<Option<String>>()?
-        .unwrap_or_default()
-        .trim()
-        .to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{path::PathBuf, process::Command};
 
+    use e_agent_tool::SessionId;
     use pyo3::prelude::*;
 
     use crate::tool::ToolExecutor;
@@ -339,7 +425,7 @@ mod tests {
         code: impl ToString,
     ) -> String {
         let output = executor
-            .call("", code.to_string())
+            .call(SessionId::next(), "", code.to_string())
             .await
             .unwrap()
             .content
@@ -419,7 +505,7 @@ asyncio.run(main())"#
 
         Python::attach(|py| {
             pyo3_async_runtimes::tokio::run(py, async move {
-                let output = executor.execute(code).await.unwrap();
+                let output = executor.execute(SessionId::next(), code).await.unwrap();
                 let output = format!("{}{}", output.stdout, output.stderr);
                 assert!(output.contains("Successfully wrote"));
                 assert!(output.contains("Successfully replaced"));
@@ -444,17 +530,26 @@ asyncio.run(main())"#
     }
 
     /// Build the basic tools extension and load it into a fresh executor.
+    fn built_executor() -> ProgrammaticToolExecutor {
+        let mut executor = ProgrammaticToolExecutor::default();
+        executor
+            .load(build_extension("e-agent-basic-tools", "basic_tools"))
+            .unwrap();
+        executor
+    }
+
+    /// Build one extension cdylib and stage it as an importable Python module.
     ///
     /// Windows locks a loaded `.pyd`, so the copy only happens once per build.
-    fn built_executor() -> ProgrammaticToolExecutor {
+    fn build_extension(package: &str, library_name: &str) -> PathBuf {
         static BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = BUILD
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        let target = root.join("target/basic-tools-test");
+        let target = root.join(format!("target/{library_name}-test"));
         let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "e-agent-basic-tools", "--target-dir"])
+            .args(["build", "-p", package, "--target-dir"])
             .arg(&target)
             .current_dir(&root)
             .status()
@@ -462,22 +557,22 @@ asyncio.run(main())"#
         assert!(status.success());
         #[cfg(windows)]
         let (library, extension) = (
-            target.join("debug/basic_tools.dll"),
-            target.join("debug/basic_tools.pyd"),
+            target.join(format!("debug/{library_name}.dll")),
+            target.join(format!("debug/{library_name}.pyd")),
         );
         #[cfg(target_os = "linux")]
         let (library, extension) = {
-            let library = target.join("debug/libbasic_tools.so");
+            let library = target.join(format!("debug/lib{library_name}.so"));
             (library.clone(), library)
         };
         #[cfg(target_os = "macos")]
         let (library, extension) = (
-            target.join("debug/libbasic_tools.dylib"),
-            target.join("debug/basic_tools.so"),
+            target.join(format!("debug/lib{library_name}.dylib")),
+            target.join(format!("debug/{library_name}.so")),
         );
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         let (library, extension) = {
-            let library = target.join("debug/libbasic_tools.so");
+            let library = target.join(format!("debug/lib{library_name}.so"));
             (library.clone(), library)
         };
         if library != extension
@@ -486,30 +581,76 @@ asyncio.run(main())"#
         {
             panic!("cannot stage {}", extension.display());
         }
-        let mut executor = ProgrammaticToolExecutor::default();
-        executor.load(extension).unwrap();
-        executor
+        extension
     }
 
+    /// Every workspace extension loads and exposes its tools after migration.
     #[test]
-    #[ignore = "run after powershell -File scripts/build-tool.ps1 -Debug"]
-    fn loads_compiled_rust_extension_file() {
+    fn loads_every_workspace_extension() {
         Python::initialize();
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/my_ext.pyd");
         let mut executor = ProgrammaticToolExecutor::default();
-        executor.load(path).unwrap();
         executor
-            .load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pure_tools"))
+            .load(build_extension("e-agent-basic-tools", "basic_tools"))
+            .unwrap();
+        executor
+            .load(build_extension("e-my-ext", "my_ext"))
+            .unwrap();
+        executor
+            .load(build_extension("e-web-access", "web_access"))
             .unwrap();
 
-        let tools = executor.tools();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].name, "my_ext");
-        assert_eq!(tools[0].functions.len(), 2);
+        let extensions = executor.tools();
+        let tools: Vec<(&str, Vec<&str>)> = extensions
+            .iter()
+            .map(|extension| {
+                (
+                    extension.name.as_str(),
+                    extension
+                        .functions
+                        .iter()
+                        .map(|function| function.name.as_str())
+                        .collect(),
+                )
+            })
+            .collect();
         assert_eq!(
-            tools[0].functions[0].schema["properties"]["city"]["description"],
+            tools,
+            [
+                ("basic_tools", vec!["read", "write", "edit", "bash"]),
+                ("my_ext", vec!["weather", "get_attraction"]),
+                ("web_access", vec!["web_search", "web_fetch"]),
+            ]
+        );
+        // Doc comments stay the tool description and #[desc] stays the parameter description.
+        assert_eq!(
+            extensions[1].functions[0].description,
+            "异步查询指定城市的实时天气"
+        );
+        assert_eq!(
+            extensions[1].functions[0].schema["properties"]["city"]["description"],
             "需要查询实时天气的城市名称"
         );
+        assert_eq!(executor.system_prompts().len(), 3);
+
+        // Executing a migrated stateless tool still works end to end.
+        Python::attach(|py| {
+            pyo3_async_runtimes::tokio::run(py, async move {
+                let code = "import asyncio, basic_tools
+async def main():
+    print(await basic_tools.bash(\"printf migrated\"))
+asyncio.run(main())";
+                assert!(
+                    executor
+                        .execute(SessionId::next(), code)
+                        .await
+                        .unwrap()
+                        .stdout
+                        .contains("migrated")
+                );
+                Ok(())
+            })
+        })
+        .unwrap();
     }
 
     #[test]
@@ -533,15 +674,277 @@ asyncio.run(main())"#
             pyo3_async_runtimes::tokio::run(py, async move {
                 let code =
                     "import asyncio, pure_tools\nasync def main():\n    print(await pure_tools.multiply(6, 7))\nasyncio.run(main())";
-                assert_eq!(executor.execute(code).await.unwrap().stdout, "42\n");
+                assert_eq!(executor.execute(SessionId::next(), code).await.unwrap().stdout, "42\n");
 
                 // let code = "raise ValueError('bad code')";
                 // execute_and_get_output(&executor, code).await;
                 let code = "print('restored')";
-                assert_eq!(executor.execute(code).await.unwrap().stdout, "restored\n");
+                assert_eq!(executor.execute(SessionId::next(), code).await.unwrap().stdout, "restored\n");
                 Ok(())
             })
         })
         .unwrap();
+    }
+
+    /// Extension metadata, including its system prompt, round-trips through PyO3.
+    #[test]
+    fn round_trips_extension_metadata() {
+        Python::initialize();
+        let mut executor = ProgrammaticToolExecutor::default();
+        executor
+            .load(build_extension("e-state-probe", "state_probe"))
+            .unwrap();
+
+        let extensions = executor.tools();
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0].name, "state_probe");
+        assert_eq!(extensions[0].description, "Remember values per session");
+        assert_eq!(
+            extensions[0].system_prompt,
+            "Use state_probe to remember values inside one session."
+        );
+        assert_eq!(
+            extensions[0]
+                .functions
+                .iter()
+                .map(|function| function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["remember", "recall"]
+        );
+        // The state parameter stays out of the model-visible schema.
+        assert_eq!(
+            extensions[0].functions[0].schema["required"],
+            serde_json::json!(["value"])
+        );
+        assert!(
+            !extensions[0].functions[0].schema["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("state")
+        );
+        assert_eq!(
+            extensions[0].functions[1].schema["properties"]
+                .as_object()
+                .map_or(0, |properties| properties.len()),
+            0
+        );
+
+        // The Python signatures must match the schemas, with no state parameter.
+        // `validate_module` already enforces this during load; assert it directly.
+        Python::attach(|py| {
+            let signature = py.import("inspect").unwrap().getattr("signature").unwrap();
+            let module = py.import("state_probe").unwrap();
+            for (tool, expected) in [("remember", "(value)"), ("recall", "()")] {
+                let rendered = signature
+                    .call1((module.getattr(tool).unwrap(),))
+                    .unwrap()
+                    .str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(rendered, expected);
+            }
+        });
+    }
+
+    /// State is shared inside one session, isolated across sessions, and dropped per session.
+    #[test]
+    fn isolates_and_drops_session_state() {
+        Python::initialize();
+        let mut executor = ProgrammaticToolExecutor::default();
+        executor
+            .load(build_extension("e-state-probe", "state_probe"))
+            .unwrap();
+
+        let first = SessionId::next();
+        let second = SessionId::next();
+        // Tool coroutines must be created inside a running loop, so every script
+        // awaits them from one `main()`.
+        let remember = |value: &str| {
+            format!(
+                "import asyncio, state_probe
+async def main():
+    print(await state_probe.remember({value}))
+asyncio.run(main())",
+                value = serde_json::to_string(value).unwrap()
+            )
+        };
+        let recall = "import asyncio, state_probe
+async def main():
+    print('recall=' + await state_probe.recall())
+asyncio.run(main())";
+
+        Python::attach(|py| {
+            pyo3_async_runtimes::tokio::run(py, async move {
+                assert_eq!(
+                    executor.execute(first, remember("a")).await.unwrap().stdout,
+                    "a
+"
+                );
+                assert_eq!(
+                    executor.execute(first, remember("b")).await.unwrap().stdout,
+                    "a,b
+"
+                );
+
+                // A second session cannot observe the first session's state.
+                assert_eq!(
+                    executor.execute(second, recall).await.unwrap().stdout,
+                    "recall=
+"
+                );
+                assert_eq!(
+                    executor
+                        .execute(second, remember("z"))
+                        .await
+                        .unwrap()
+                        .stdout,
+                    "z
+"
+                );
+                assert_eq!(
+                    executor.execute(first, recall).await.unwrap().stdout,
+                    "recall=a,b
+"
+                );
+
+                // Dropping one session clears only that session's slot.
+                executor.drop_session(first).await.unwrap();
+                assert_eq!(
+                    executor.execute(first, recall).await.unwrap().stdout,
+                    "recall=
+"
+                );
+                assert_eq!(
+                    executor.execute(second, recall).await.unwrap().stdout,
+                    "recall=z
+"
+                );
+                Ok(())
+            })
+        })
+        .unwrap();
+    }
+
+    /// A failing script still clears the bound session, and the next session's
+    /// state is unaffected.
+    #[test]
+    fn clears_bound_session_on_error() {
+        Python::initialize();
+        let mut executor = ProgrammaticToolExecutor::default();
+        executor
+            .load(build_extension("e-state-probe", "state_probe"))
+            .unwrap();
+
+        let failing = SessionId::next();
+        let next = SessionId::next();
+        let remember = "import asyncio, state_probe
+async def main():
+    await state_probe.remember('leaked')
+    raise ValueError('boom')
+asyncio.run(main())";
+        let recall = "import asyncio, state_probe
+async def main():
+    print('recall=' + await state_probe.recall())
+asyncio.run(main())";
+
+        Python::attach(|py| {
+            pyo3_async_runtimes::tokio::run(py, async move {
+                assert!(executor.execute(failing, remember).await.is_err());
+
+                // The failed session kept its own state, and no session is bound now.
+                assert_eq!(e_agent_tool::current_session(), SessionId(0));
+                assert_eq!(
+                    executor.execute(next, recall).await.unwrap().stdout,
+                    "recall=
+"
+                );
+                assert_eq!(
+                    executor.execute(failing, recall).await.unwrap().stdout,
+                    "recall=leaked
+"
+                );
+                Ok(())
+            })
+        })
+        .unwrap();
+    }
+
+    /// Reloading one extension replaces its metadata instead of duplicating it,
+    /// and system prompts follow load order.
+    #[test]
+    fn replaces_reloaded_extension_and_orders_prompts() {
+        Python::initialize();
+        let probe = build_extension("e-state-probe", "state_probe");
+        let pure = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pure_tools");
+        let mut executor = ProgrammaticToolExecutor::default();
+        executor.load(&probe).unwrap();
+        executor.load(&pure).unwrap();
+        executor.load(&probe).unwrap();
+
+        let names: Vec<_> = executor
+            .tools()
+            .into_iter()
+            .map(|extension| extension.name)
+            .collect();
+        assert_eq!(names, ["state_probe", "pure_tools"]);
+        assert_eq!(
+            executor.system_prompts(),
+            [
+                "Use state_probe to remember values inside one session.",
+                "Use pure_tools.multiply for exact integer products.",
+            ]
+        );
+    }
+
+    /// A missing or malformed metadata export is reported with the module name.
+    #[test]
+    fn rejects_module_without_extension_metadata() {
+        Python::initialize();
+        let directory = std::env::temp_dir().join(format!(
+            "e-agent-bad-extension-{}-{}",
+            std::process::id(),
+            SessionId::next()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let module = directory.join("no_metadata.py");
+        std::fs::write(
+            &module,
+            "async def noop():
+    return None
+",
+        )
+        .unwrap();
+
+        let error = format!(
+            "{:#}",
+            ProgrammaticToolExecutor::default()
+                .load(&module)
+                .unwrap_err()
+        );
+        assert!(
+            error.contains("no_metadata does not define __e_agent_extension__"),
+            "unexpected error: {error}"
+        );
+
+        std::fs::write(
+            &module,
+            "async def noop():
+    return None
+
+__e_agent_extension__ = '{'
+",
+        )
+        .unwrap();
+        let error = format!(
+            "{:#}",
+            ProgrammaticToolExecutor::default()
+                .load(&module)
+                .unwrap_err()
+        );
+        assert!(
+            error.contains("invalid __e_agent_extension__ in no_metadata"),
+            "unexpected error: {error}"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

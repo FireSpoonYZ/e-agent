@@ -1,0 +1,6 @@
+error: #[state] is only allowed on a struct inside an #[extension] module
+ --> tests/compile-fail/state_outside_extension.rs:2:1
+  |
+2 | / #[derive(Default)]
+3 | | struct Loose {}
+  | |_______________^

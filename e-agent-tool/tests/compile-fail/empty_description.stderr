@@ -1,0 +1,5 @@
+error: #[extension] description must not be empty
+ --> tests/compile-fail/empty_description.rs:3:27
+  |
+3 | #[extension(description = "  ")]
+  |                           ^^^^

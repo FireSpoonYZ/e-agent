@@ -1,16 +1,15 @@
-use e_agent_tool::{Context, JsonSchema, Result, Serialize, tool};
+use e_agent_tool::{Context, JsonSchema, Result, Serialize};
 use serde::Deserialize;
 use websearch::{SearchOptions, SearchProvider, providers::SearxNGProvider};
 
-#[tool]
-/// 异步查询指定城市的实时天气
-pub async fn web_fetch(
-    #[desc("The search query text")] query: String,
-    #[desc("Maximum number of results to return")] max_results: Option<u32>,
-    #[desc("Language/locale for results")] language: Option<String>,
-    #[desc("Country/region for results")] region: Option<String>,
-    #[desc("Result page number (for pagination)")] page: Option<u32>,
-    #[desc("Custom timeout in milliseconds")] timeout: Option<u64>,
+/// Fetch web search results through the websearch SearXNG provider.
+pub async fn run(
+    query: String,
+    max_results: Option<u32>,
+    language: Option<String>,
+    region: Option<String>,
+    page: Option<u32>,
+    timeout: Option<u64>,
 ) -> Result<Vec<SearchResult>> {
     let base_url = std::env::var("SEARXNG_BASE_URL").context("SEARXNG_BASE_URL is not set")?;
     let provider = SearxNGProvider::new(&base_url).context("connect to searxng failed")?;
