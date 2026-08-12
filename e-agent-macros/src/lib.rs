@@ -94,11 +94,11 @@ fn expand_tool(function: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 ::e_agent_tool::__private::serde::Deserialize
             )]
             #[serde(deny_unknown_fields)]
-            pub(super) struct Input {
+            pub(crate) struct Input {
                 #(#fields,)*
             }
 
-            pub(super) struct Definition;
+            pub(crate) struct Definition;
 
             impl ::e_agent_tool::Tool for Definition {
                 type Input = Input;
@@ -117,7 +117,7 @@ fn expand_tool(function: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 name = #python_name,
                 signature = (#(#python_signature),*)
             )]
-            pub(super) fn python(
+            pub(crate) fn python(
                 py: ::e_agent_tool::__private::pyo3::Python,
                 #(#python_fields,)*
             ) -> ::e_agent_tool::__private::pyo3::PyResult<
