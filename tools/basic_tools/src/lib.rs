@@ -16,8 +16,7 @@ mod write_impl;
 use e_agent_tool::{Deserialize, JsonSchema, Result, extension};
 use serde_json::Value;
 
-#[derive(Clone, Deserialize, JsonSchema, pyo3::FromPyObject)]
-#[pyo3(from_item_all)]
+#[derive(Clone, Deserialize, JsonSchema)]
 struct Replacement {
     /// Exact text to replace; it must occur exactly once in the original file.
     old_text: String,

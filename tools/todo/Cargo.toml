@@ -1,0 +1,18 @@
+[package]
+name = "e-todo"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "todo"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.104"
+e-agent-tool = { path = "../../e-agent-tool" }
+pyo3 = { version = "0.29.2", features = ["abi3-py314", "extension-module", "generate-import-lib"] }
+reqwest = "0.13.4"
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_yaml = "0.9.34"
+tavily = "2.1.0"

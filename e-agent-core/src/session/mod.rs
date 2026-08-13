@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use e_agent_tool::SessionId;
 
 use crate::{
@@ -68,7 +68,8 @@ impl<P: Provider, E: ToolExecutor> Session<P, E> {
                 messages: &self.messages,
                 tools: &tool_defs,
             };
-            let answer = match self.provider.send("gpt-5.6-sol", context).await {
+            let model = std::env::var("E_MODULE_BIG").context("get model failed")?;
+            let answer = match self.provider.send(&model, context).await {
                 Ok(answer) => answer,
                 Err(e) => {
                     println!("llm invoke failed: {e:?}");

@@ -17,6 +17,8 @@ pub use state::{
 };
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 #[doc(hidden)]
@@ -32,6 +34,7 @@ pub mod __private {
 pub struct ToolFunction {
     pub name: String,
     pub description: String,
+    pub requires_await: bool,
     pub schema: Value,
     pub output_schema: Value,
 }
@@ -62,8 +65,23 @@ pub fn tool_function<T: Tool>() -> Result<ToolFunction> {
     Ok(ToolFunction {
         name: T::NAME.to_string(),
         description: T::DESCRIPTION.to_string(),
+        requires_await: true,
         schema: serde_json::to_value(schemars::schema_for!(T::Input))?,
         output_schema: serde_json::to_value(schemars::schema_for!(T::Output))?,
+    })
+}
+
+#[doc(hidden)]
+pub fn input_from_python<T: DeserializeOwned>(
+    py: Python<'_>,
+    input: &Bound<'_, PyDict>,
+) -> PyResult<T> {
+    let input: String = py
+        .import("json")?
+        .call_method1("dumps", (input,))?
+        .extract()?;
+    serde_json::from_str(&input).map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid tool input: {err}"))
     })
 }
 

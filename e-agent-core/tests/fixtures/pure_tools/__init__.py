@@ -1,7 +1,7 @@
 """Pure Python test tools."""
 
 
-async def multiply(x, y):
+def multiply(x, y):
     return x * y
 
 
@@ -13,6 +13,7 @@ __e_agent_extension__ = {
         {
             "name": "multiply",
             "description": "Multiply two numbers",
+            "requires_await": False,
             "schema": {
                 "type": "object",
                 "additionalProperties": False,

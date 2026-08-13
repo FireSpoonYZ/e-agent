@@ -1,12 +1,16 @@
 use async_openai::{
     Client,
     config::OpenAIConfig,
-    types::responses::{
-        CreateResponseArgs, CustomGrammarFormatParam, CustomToolCallOutput,
-        CustomToolCallOutputOutput, CustomToolParam, CustomToolParamFormat, EasyInputMessage,
-        FunctionCallOutput, FunctionCallOutputItemParam, FunctionTool, FunctionToolCall,
-        GrammarSyntax, InputContent, InputItem, InputParam, InputTextContent, Item, OutputItem,
-        OutputMessageContent, Response, Role, Status, Tool,
+    types::{
+        chat::ReasoningEffort,
+        responses::{
+            CreateResponseArgs, CustomGrammarFormatParam, CustomToolCallOutput,
+            CustomToolCallOutputOutput, CustomToolParam, CustomToolParamFormat, EasyInputMessage,
+            FunctionCallOutput, FunctionCallOutputItemParam, FunctionTool, FunctionToolCall,
+            GrammarSyntax, InputContent, InputItem, InputParam, InputTextContent, Item, OutputItem,
+            OutputMessageContent, ReasoningArgs, ReasoningSummary, Response, Role, Status,
+            SummaryPart, Tool,
+        },
     },
 };
 
@@ -14,7 +18,7 @@ use super::Provider;
 use crate::message::{
     AssistantMessage, Message, MessageContent, StopReason, ToolDef, ToolInput, Usage,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 pub struct OpenAIProvider {
     client: Client<OpenAIConfig>,
@@ -47,8 +51,17 @@ impl Provider for OpenAIProvider {
         context: crate::message::Context<'_>,
     ) -> Result<AssistantMessage> {
         let mut request = CreateResponseArgs::default();
+        let (model, effort) = model.split_once(":").unwrap_or((model, "none"));
+        let effort = serde_json::from_str::<ReasoningEffort>(&format!(r#""{}""#, effort))
+            .context("reasoning effort format error")?;
+        let reasoning = ReasoningArgs::default()
+            .effort(effort)
+            .summary(ReasoningSummary::Detailed)
+            .build()
+            .context("reasoning effort build failed")?;
         request
             .model(model)
+            .reasoning(reasoning)
             .input(InputParam::Items(to_input_items(context.messages)))
             .store(false);
         if let Some(system_prompt) = context.system_prompt {
@@ -247,6 +260,22 @@ fn from_response(response: Response) -> Result<AssistantMessage> {
                     item_id: Some(call.id),
                 });
             }
+            OutputItem::Reasoning(reasoning) => content.push(MessageContent::Thinking {
+                thinking: reasoning
+                    .summary
+                    .into_iter()
+                    .fold(String::new(), |total, s| {
+                        format!(
+                            "{}{}",
+                            total,
+                            match s {
+                                SummaryPart::SummaryText(summary_text_content) =>
+                                    summary_text_content.text,
+                            }
+                        )
+                    }),
+                signature: None,
+            }),
             // Reasoning items are dropped: see `to_input_items`.
             _ => {}
         }

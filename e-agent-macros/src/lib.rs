@@ -403,7 +403,23 @@ fn expand_tool(
         saw_optional |= optional;
         let attrs = field_attributes(&argument.attrs)?;
         fields.push(quote!(#(#attrs)* #ident: #ty));
-        python_fields.push(quote!(#ident: #ty));
+        python_fields.push(if optional {
+            quote!(
+                #ident: ::std::option::Option<
+                    ::e_agent_tool::__private::pyo3::Bound<
+                        '_,
+                        ::e_agent_tool::__private::pyo3::PyAny
+                    >
+                >
+            )
+        } else {
+            quote!(
+                #ident: ::e_agent_tool::__private::pyo3::Bound<
+                    '_,
+                    ::e_agent_tool::__private::pyo3::PyAny
+                >
+            )
+        });
         python_signature.push(if optional {
             quote!(#ident = None)
         } else {
@@ -468,7 +484,12 @@ fn expand_tool(
             ) -> ::e_agent_tool::__private::pyo3::PyResult<
                 ::e_agent_tool::__private::pyo3::Py<::e_agent_tool::__private::pyo3::PyAny>
             > {
-                ::e_agent_tool::run::<Definition>(py, Input { #(#input_fields,)* })
+                use ::e_agent_tool::__private::pyo3::types::PyDictMethods as _;
+
+                let input = ::e_agent_tool::__private::pyo3::types::PyDict::new(py);
+                #(input.set_item(stringify!(#input_fields), #input_fields)?;)*
+                let input = ::e_agent_tool::input_from_python::<Input>(py, &input)?;
+                ::e_agent_tool::run::<Definition>(py, input)
             }
         }
     })

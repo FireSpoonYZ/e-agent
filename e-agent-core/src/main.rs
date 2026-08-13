@@ -9,10 +9,19 @@ mod session;
 mod tool;
 
 use anyhow::{Context, Result, anyhow};
+use clap::Parser;
 
-const SYSTEM_PROMPT: &str = r#"你是运行在 e（一套 coding agent harness，编码代理宿主程序）中的专家级编码助手。你通过读取文件、执行命令、编辑代码以及写入新文件来帮助用户。"#;
+const SYSTEM_PROMPT: &str = r#"你是运行在 e（一套 coding agent harness，编码代理宿主程序）中的专家级编码助手。你通过读取文件、执行命令、编辑代码以及写入新文件来帮助用户。注意使用utf-8编码"#;
+
+#[derive(Debug, Parser)]
+#[command(about = "e-agent")]
+struct Cli {
+    /// 要发送给 agent 的提示词
+    prompt: String,
+}
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
     dotenvy::dotenv().context("load .env failed")?;
     let provider = OpenAIProvider::new();
     let mut tool_executor = ProgrammaticToolExecutor::default();
@@ -30,9 +39,7 @@ async fn main() -> Result<()> {
     }
 
     let mut session = Session::new(provider, tool_executor, SYSTEM_PROMPT);
-    session
-        .run_one_trun(UserMessage::text("commit一下代码"))
-        .await?;
+    session.run_one_trun(UserMessage::text(cli.prompt)).await?;
     session.close().await?;
 
     Ok(())

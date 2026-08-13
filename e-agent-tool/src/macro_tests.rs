@@ -107,6 +107,7 @@ fn exports_extension_metadata() {
         extension.functions[0].description,
         "Remember one value and return the whole list."
     );
+    assert!(extension.functions.iter().all(|tool| tool.requires_await));
     assert_eq!(
         extension.functions[0].schema["properties"]["value"]["description"],
         "Value to remember"
@@ -132,6 +133,13 @@ fn exports_extension_metadata() {
     .unwrap();
     assert!(round_trip.system_prompt.is_empty());
     assert_eq!(round_trip.functions[0].name, "remember");
+
+    let mut metadata = serde_json::to_value(&round_trip).unwrap();
+    metadata["functions"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("requires_await");
+    assert!(serde_json::from_value::<ToolExtension>(metadata).is_err());
 }
 
 /// A `#[state]` parameter must not reach the input schema or Python signature.

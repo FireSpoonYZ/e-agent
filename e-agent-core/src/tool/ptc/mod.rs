@@ -48,8 +48,9 @@ impl ToolExecutor for ProgrammaticToolExecutor {
                  The externally provided tools are exposed as the Python modules and functions listed below; import \
                  those modules when their specialized capabilities are useful. Prefer one coherent script that \
                  combines ordinary Python with these tools, chains dependent operations, and keeps intermediate \
-                 values in memory instead of printing them merely to pass them into another tool call. Registered \
-                 async functions must be awaited, typically via asyncio.run(...). Tool results are JSON-compatible \
+                 values in memory instead of printing them merely to pass them into another tool call. Each function's \
+                 requires_await field specifies how to call it: use await when true and call it normally when false. \
+                 Run awaited calls inside an async function, typically via asyncio.run(...). Tool results are JSON-compatible \
                  Python values; JSON Schema objects are dicts, so access fields with result[\"field\"], not \
                  attributes. Call tool functions with normal Python keyword arguments, for example \
                  fn(path=\"file\"), rather than passing a single dict as a positional argument. Print only the \
@@ -67,9 +68,20 @@ impl ToolExecutor for ProgrammaticToolExecutor {
         code: String,
     ) -> Result<ToolOutput, Self::Error> {
         let output = self.execute(session, code).await?;
-        let content = serde_json::to_string(&output).context("serialize ptc output failed")?;
+        let content = match (output.stdout.is_empty(), output.stderr.is_empty()) {
+            (true, true) => {
+                let content =
+                    serde_json::to_string(&output).context("serialize ptc output failed")?;
+                vec![MessageContent::text(content)]
+            }
+            (true, false) => vec![MessageContent::text(format!("stderr:\n{}", output.stderr))],
+            (false, true) => vec![MessageContent::text(format!("stdout:\n{}", output.stdout))],
+            (false, false) => vec![MessageContent::text(
+                "both stdout and stderr is empty".to_string(),
+            )],
+        };
         Ok(ToolOutput {
-            content: vec![MessageContent::text(content)],
+            content,
             details: None,
         })
     }
@@ -438,6 +450,26 @@ mod tests {
     }
 
     #[test]
+    fn diagnoses_subprocess_cargo() {
+        Python::initialize();
+        let executor = ProgrammaticToolExecutor::default();
+        let code = r#"import subprocess
+for cmd in [['cargo', '--version'], ['cargo', 'fmt', '--all']]:
+    print('starting', cmd, flush=True)
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
+    print('finished', p.returncode, p.stdout, p.stderr, flush=True)
+"#;
+        Python::attach(|py| {
+            pyo3_async_runtimes::tokio::run(py, async move {
+                let output = executor.execute(SessionId::next(), code).await.unwrap();
+                eprintln!("{}{}", output.stdout, output.stderr);
+                Ok(())
+            })
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn loads_and_runs_basic_tools() {
         Python::initialize();
         let executor = built_executor();
@@ -665,6 +697,12 @@ asyncio.run(main())";
         assert_eq!(tools[0].name, "pure_tools");
         assert_eq!(tools[0].description, "Pure Python test tools.");
         assert_eq!(tools[0].functions[0].name, "multiply");
+        assert!(!tools[0].functions[0].requires_await);
+        assert!(
+            executor.tool_defs()[0]
+                .description
+                .contains("\"requires_await\":false")
+        );
         assert_eq!(
             tools[0].functions[0].schema["properties"]["x"]["description"],
             "first factor"
@@ -672,14 +710,27 @@ asyncio.run(main())";
 
         Python::attach(|py| {
             pyo3_async_runtimes::tokio::run(py, async move {
-                let code =
-                    "import asyncio, pure_tools\nasync def main():\n    print(await pure_tools.multiply(6, 7))\nasyncio.run(main())";
-                assert_eq!(executor.execute(SessionId::next(), code).await.unwrap().stdout, "42\n");
+                let code = "import pure_tools\nprint(pure_tools.multiply(6, 7))";
+                assert_eq!(
+                    executor
+                        .execute(SessionId::next(), code)
+                        .await
+                        .unwrap()
+                        .stdout,
+                    "42\n"
+                );
 
                 // let code = "raise ValueError('bad code')";
                 // execute_and_get_output(&executor, code).await;
                 let code = "print('restored')";
-                assert_eq!(executor.execute(SessionId::next(), code).await.unwrap().stdout, "restored\n");
+                assert_eq!(
+                    executor
+                        .execute(SessionId::next(), code)
+                        .await
+                        .unwrap()
+                        .stdout,
+                    "restored\n"
+                );
                 Ok(())
             })
         })

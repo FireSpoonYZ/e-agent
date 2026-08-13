@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+clap = { version = "4.5.53", features = ["derive"] }
 async-channel = "2.5.0"
 async-openai = { version = "0.41.3", features = ["chat-completion", "responses"] }
 async-trait = "0.1.92"

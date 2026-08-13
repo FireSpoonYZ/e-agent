@@ -16,5 +16,7 @@ $pythonHome = $line.Substring('PYTHONHOME='.Length).Trim()
 $env:PYTHONHOME = $pythonHome
 $env:PATH = "$pythonHome;$env:PATH"
 
-& $Executable @Arguments
+# `powershell -Command` splits Cargo's quoted prompt before this script receives it.
+# e-agent has exactly one positional prompt, so restore it before invocation.
+& $Executable ($Arguments -join ' ')
 exit $LASTEXITCODE
