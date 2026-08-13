@@ -2,7 +2,7 @@ use anyhow::Result;
 use e_agent_tool::SessionId;
 
 use crate::{
-    message::{Message, ToolResultMessage, UserMessage},
+    message::{Message, MessageContent, ToolResultMessage, UserMessage},
     provider::Provider,
     tool::ToolExecutor,
 };
@@ -76,59 +76,68 @@ impl<P: Provider, E: ToolExecutor> Session<P, E> {
                 }
             };
 
+            print_message(&answer.content);
+
+            println!("================================");
+
             self.messages.push(Message::Assistant(answer.clone()));
 
             // toolcall
-            let mut tc = Vec::new();
+            let mut will_stop_loop = true;
             for content in answer.content.into_iter() {
-                match content {
-                    crate::message::MessageContent::Text { text } => {
-                        println!("say: {text}");
-                    }
-                    crate::message::MessageContent::Thinking { thinking, .. } => {
-                        println!("thinking: {thinking}");
-                    }
-                    crate::message::MessageContent::ToolUse {
-                        id,
-                        name,
-                        input,
-                        custom,
-                        ..
-                    } => {
-                        println!("tool use: {}\n{}", name, input);
-                        tc.push((id, name, input, custom));
-                    }
+                if let MessageContent::ToolUse {
+                    id,
+                    name,
+                    input,
+                    custom,
+                    ..
+                } = content
+                {
+                    will_stop_loop = false;
+                    let tool_result = match self.tool_executor.call(self.id, &name, input).await {
+                        Ok(output) => ToolResultMessage {
+                            tool_use_id: id,
+                            content: output.content,
+                            is_error: false,
+                            custom,
+                        },
+                        Err(e) => {
+                            let mut result = ToolResultMessage::error(id, format!("{e:?}"));
+                            result.custom = custom;
+                            result
+                        }
+                    };
+
+                    print_message(&tool_result.content);
+
+                    self.messages.push(Message::ToolResult(tool_result));
                 }
             }
 
-            if tc.is_empty() {
+            if will_stop_loop {
                 println!("tool call is empty, finish this trun");
                 break;
             }
 
-            for (id, name, input, custom) in tc.into_iter() {
-                let tool_result = match self.tool_executor.call(self.id, &name, input).await {
-                    Ok(output) => ToolResultMessage {
-                        tool_use_id: id,
-                        content: output.content,
-                        is_error: false,
-                        custom,
-                    },
-                    Err(e) => {
-                        let mut result = ToolResultMessage::error(id, format!("{e:?}"));
-                        result.custom = custom;
-                        result
-                    }
-                };
-
-                println!("tool_result: {:?}", tool_result);
-
-                self.messages.push(Message::ToolResult(tool_result));
-            }
-
-            println!("================================");
+            println!("================================\n\n\n");
         }
         Ok(())
+    }
+}
+
+fn print_message(content: &[MessageContent]) {
+    for content in content.iter() {
+        match content {
+            crate::message::MessageContent::Text { text } => {
+                println!("text: {text}");
+            }
+            crate::message::MessageContent::Thinking { thinking, .. } => {
+                println!("thinking: {thinking}");
+            }
+            crate::message::MessageContent::ToolUse { name, input, .. } => {
+                println!("tool use: {}\n{}", name, input);
+            }
+        }
     }
 }
 
