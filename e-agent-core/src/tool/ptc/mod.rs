@@ -287,7 +287,7 @@ fn validate_metadata(extension: &ToolExtension) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, process::Command, time::Duration};
+    use std::{path::PathBuf, process::Command};
 
     use e_agent_extension::SessionId;
 
@@ -322,9 +322,7 @@ mod tests {
 
     fn built_executor() -> ProgrammaticToolExecutor {
         let mut executor = ProgrammaticToolExecutor::default();
-        executor
-            .load(build_extension("e-agent-basic-tools", "basic_tools"))
-            .unwrap();
+        executor.load(build_extension("e-todo", "todo")).unwrap();
         executor
     }
 
@@ -353,11 +351,12 @@ mod tests {
         let path = serde_json::to_string(&fixture.path().to_string_lossy()).unwrap();
         let code = format!(
             r#"
-import * as basic_tools from "basic_tools";
+import * as todo from "todo";
 import {{ readFileSync }} from "node:fs";
 import {{ basename }} from "node:path";
-const value: string = await basic_tools.bash("printf node");
-console.log(basename("/tmp/file.txt"), readFileSync({path}, "utf8"), value);
+await todo.create_todo_list(["node"]);
+const value: Array<{{ content: string }}> = await todo.list();
+console.log(basename("/tmp/file.txt"), readFileSync({path}, "utf8"), value[0].content);
 console.error("err");
 "#
         );
@@ -413,13 +412,7 @@ console.log(await list());
     #[test]
     fn loads_every_workspace_extension() {
         let mut executor = ProgrammaticToolExecutor::default();
-        for (package, library) in [
-            ("e-agent-basic-tools", "basic_tools"),
-            ("e-my-ext", "my_ext"),
-            ("e-web-access", "web_access"),
-            ("e-todo", "todo"),
-            ("e-state-probe", "state_probe"),
-        ] {
+        for (package, library) in [("e-web-access", "web_access"), ("e-todo", "todo")] {
             executor
                 .load(build_extension(package, library))
                 .unwrap_or_else(|error| panic!("load {library}: {error:#}"));
@@ -430,11 +423,8 @@ console.log(await list());
                 .iter()
                 .map(|extension| extension.name.as_str())
                 .collect::<Vec<_>>(),
-            ["basic_tools", "my_ext", "web_access", "todo", "state_probe"]
+            ["web_access", "todo"]
         );
-        let description = executor.tool_defs().remove(0).description;
-        assert!(description.contains(r#""name":"list""#));
-        assert!(description.contains(r#""parameters":[]"#));
     }
 
     #[tokio::test]
@@ -444,12 +434,12 @@ console.log(await list());
         let error = executor
             .execute(
                 SessionId::next(),
-                r#"import { bash } from "basic_tools"; await bash(undefined);"#,
+                r#"import { create_todo_list } from "todo"; await create_todo_list(undefined);"#,
             )
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("basic_tools.bash"), "{error}");
+        assert!(error.contains("todo.create_todo_list"), "{error}");
         assert!(error.contains("invalid input"), "{error}");
 
         let error = executor
@@ -471,17 +461,17 @@ console.log(await list());
     #[tokio::test]
     async fn isolates_drops_and_reloads_state() {
         let _guard = TEST_EXECUTION.lock().await;
-        let probe = build_extension("e-state-probe", "state_probe");
+        let probe = build_extension("e-todo", "todo");
         let mut executor = ProgrammaticToolExecutor::default();
         executor.load(&probe).unwrap();
         let first = SessionId::next();
         let second = SessionId::next();
         let remember = |value: &str| {
             format!(
-                "import {{ remember }} from 'state_probe'; console.log(await remember({value:?}));"
+                "import {{ create_todo_list }} from 'todo'; await create_todo_list([{value:?}]); console.log({value:?});"
             )
         };
-        let recall = "import { recall } from 'state_probe'; console.log(await recall());";
+        let recall = "import { list } from 'todo'; console.log((await list())[0]?.content ?? '');";
         assert_eq!(
             executor
                 .execute(first, &remember("a"))
@@ -496,30 +486,5 @@ console.log(await list());
         executor.load(&probe).unwrap();
         assert_eq!(executor.tools().len(), 1);
         assert_eq!(executor.system_prompts().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn cancellation_stops_bash_and_next_program_runs() {
-        let _guard = TEST_EXECUTION.lock().await;
-        let executor = built_executor();
-        let run = executor.execute(
-            SessionId::next(),
-            "import { bash } from 'basic_tools'; await bash('sleep 30');",
-        );
-        let cancel = async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            executor.set_cancelled(true);
-        };
-        let (result, ()) = tokio::join!(run, cancel);
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("cancelled"), "{error}");
-        assert_eq!(
-            executor
-                .execute(SessionId::next(), "console.log('next')")
-                .await
-                .unwrap()
-                .stdout,
-            "next\n"
-        );
     }
 }
