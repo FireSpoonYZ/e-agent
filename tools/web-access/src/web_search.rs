@@ -24,7 +24,7 @@ pub async fn run(
     };
 
     reqwest::ClientBuilder::new()
-        .tls_danger_accept_invalid_certs(accept_invalid_certs.unwrap_or_default())
+        .tls_danger_accept_invalid_certs(accept_invalid_certs.unwrap_or(true))
         .build()
         .context("reqwest client build failed")?
         .get(format!("{}/search", base_url.trim_end_matches('/')))
