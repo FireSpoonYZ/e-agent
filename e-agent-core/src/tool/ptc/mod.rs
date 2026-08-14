@@ -48,8 +48,8 @@ impl ToolExecutor for ProgrammaticToolExecutor {
         vec![ToolDef {
             name: "node".into(),
             description: format!(
-                "Execute one complete TypeScript ES module as a program in the Node-compatible QuickJS runtime. Write normal program logic: declare variables and functions, use conditionals and loops, transform data, handle errors, and combine results. A single program may import extension modules and make multiple native tool calls, using the result of one call in later calls; batch related work in one program when useful. Top-level await, console.log, console.error, and supported Node built-ins are available. Native extension functions use the positional parameters listed in their metadata and return Promises. The program runs in one isolated execution and its stdout/stderr are captured. This is not a complete Node.js or npm runtime.\nSupported extension modules:\n{}",
-                serde_json::to_string(&self.tools()).expect("tool metadata must serialize")
+                "Execute one complete TypeScript ES module as a program in the Node-compatible QuickJS runtime. Write normal program logic: declare variables and functions, use conditionals and loops, transform data, handle errors, and combine results. A single program may import extension modules and make multiple native tool calls, using the result of one call in later calls; batch related work in one program when useful. Top-level await, console.log, console.error, and supported Node built-ins are available. Native extension functions use the positional parameters listed in their metadata and return Promises. The program runs in one isolated execution and its stdout/stderr are captured. This is not a complete Node.js or npm runtime.\n\nPTC native-module rules (follow exactly):\n- Import extension modules with a static top-level ES import, for example `import {{ list, update }} from \"todo\";` or `import * as todo from \"todo\";`. Do not use `await import(...)`, `require(...)`, or dynamic module lookup for loaded extensions.\n- Call native functions with positional JavaScript arguments in the order shown by `parameters`; do not pass the metadata object. For example, use `await update(0, \"completed\")`, not `update({{ index: 0, status: \"completed\" }})`.\n- Every native function is async and must be awaited before its value is used. The `output_schema` field is authoritative. Functions whose output schema is `null` resolve to `null` and have no useful result; call them as `await update(0, \"completed\")` and do not print or assign the result. Use `console.log` only for meaningful values returned by a function or for the final program result.\n- The following JSON describes the loaded modules, functions, positional parameters, input schemas, and output schemas:\n{}",
+                serde_json::to_string_pretty(&self.tools()).expect("tool metadata must serialize")
             ),
             input: ToolInput::Text,
         }]
@@ -328,6 +328,18 @@ mod tests {
         executor
     }
 
+    #[test]
+    fn describes_static_imports_positional_calls_and_output_schemas() {
+        let description = ProgrammaticToolExecutor::default()
+            .tool_defs()
+            .remove(0)
+            .description;
+        assert!(description.contains("static top-level ES import"));
+        assert!(description.contains("do not pass the metadata object"));
+        assert!(description.contains("output schema is `null`"));
+        assert!(description.contains("input schemas, and output schemas"));
+    }
+
     #[tokio::test]
     async fn exposes_node_and_runs_typescript_with_native_module() {
         let _guard = TEST_EXECUTION.lock().await;
@@ -359,6 +371,14 @@ console.error("err");
         let _guard = TEST_EXECUTION.lock().await;
         let mut executor = ProgrammaticToolExecutor::default();
         executor.load(build_extension("e-todo", "todo")).unwrap();
+        let todo = &executor.tools()[0];
+        let update = todo
+            .functions
+            .iter()
+            .find(|function| function.name == "update")
+            .unwrap();
+        assert_eq!(update.parameters, ["index", "status"]);
+        assert_eq!(update.output_schema["type"], "null");
         let output = executor
             .execute(
                 SessionId::next(),
