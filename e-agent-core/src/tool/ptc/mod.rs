@@ -8,7 +8,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use e_agent_extension::{AbiBuffer, EXTENSION_ABI_VERSION, ExtensionV1, SessionId, ToolExtension};
-use e_agent_node_runtime::{NativeCall, NativeModule, ProgramOutput, execute_program};
+use e_agent_node_runtime::{
+    NativeCall, NativeFunction, NativeModule, ProgramOutput, execute_program,
+};
 use libloading::Library;
 use serde::Serialize;
 
@@ -46,7 +48,7 @@ impl ToolExecutor for ProgrammaticToolExecutor {
         vec![ToolDef {
             name: "node".into(),
             description: format!(
-                "Run JavaScript or TypeScript as an ES module in a Node-compatible QuickJS runtime. Top-level await, console.log, console.error, and the listed native extension modules are supported. Every native function accepts one object matching its JSON schema and returns a Promise. This is not a complete Node.js or npm runtime.\nSupported extension modules:\n{}",
+                "Execute one complete TypeScript ES module as a program in the Node-compatible QuickJS runtime. Write normal program logic: declare variables and functions, use conditionals and loops, transform data, handle errors, and combine results. A single program may import extension modules and make multiple native tool calls, using the result of one call in later calls; batch related work in one program when useful. Top-level await, console.log, console.error, and supported Node built-ins are available. Native extension functions use the positional parameters listed in their metadata and return Promises. The program runs in one isolated execution and its stdout/stderr are captured. This is not a complete Node.js or npm runtime.\nSupported extension modules:\n{}",
                 serde_json::to_string(&self.tools()).expect("tool metadata must serialize")
             ),
             input: ToolInput::Text,
@@ -164,7 +166,15 @@ impl ProgrammaticToolExecutor {
                     .metadata
                     .functions
                     .iter()
-                    .map(|function| function.name.clone())
+                    .map(|function| NativeFunction {
+                        name: function.name.clone(),
+                        parameters: function.parameters.clone(),
+                        required_parameters: function
+                            .schema
+                            .get("required")
+                            .and_then(serde_json::Value::as_array)
+                            .map_or(0, Vec::len),
+                    })
                     .collect(),
             })
             .collect::<Vec<_>>();
@@ -323,6 +333,9 @@ mod tests {
         let _guard = TEST_EXECUTION.lock().await;
         let executor = built_executor();
         assert_eq!(executor.tool_defs()[0].name, "node");
+        let node_description = executor.tool_defs().remove(0).description;
+        assert!(node_description.contains("one complete TypeScript ES module"));
+        assert!(node_description.contains("multiple native tool calls"));
         let fixture = tempfile::NamedTempFile::new_in(std::env::current_dir().unwrap()).unwrap();
         std::fs::write(fixture.path(), "file-data").unwrap();
         let path = serde_json::to_string(&fixture.path().to_string_lossy()).unwrap();
@@ -331,7 +344,7 @@ mod tests {
 import * as basic_tools from "basic_tools";
 import {{ readFileSync }} from "node:fs";
 import {{ basename }} from "node:path";
-const value: string = await basic_tools.bash({{ command: "printf node" }});
+const value: string = await basic_tools.bash("printf node");
 console.log(basename("/tmp/file.txt"), readFileSync({path}, "utf8"), value);
 console.error("err");
 "#
@@ -339,6 +352,42 @@ console.error("err");
         let output = executor.execute(SessionId::next(), &code).await.unwrap();
         assert_eq!(output.stdout, "file.txt file-data node\n");
         assert_eq!(output.stderr, "err\n");
+    }
+
+    #[tokio::test]
+    async fn calls_native_tools_with_rust_parameter_order() {
+        let _guard = TEST_EXECUTION.lock().await;
+        let mut executor = ProgrammaticToolExecutor::default();
+        executor.load(build_extension("e-todo", "todo")).unwrap();
+        let output = executor
+            .execute(
+                SessionId::next(),
+                r#"
+import { create_todo_list, update, list } from "todo";
+await create_todo_list(["inspect"]);
+await update(0, "in_progress");
+console.log(await list());
+"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            output.stdout,
+            "[{\"content\":\"inspect\",\"status\":\"in_progress\"}]\n"
+        );
+
+        let error = executor
+            .execute(
+                SessionId::next(),
+                r#"import { list } from "todo"; await list({});"#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("todo.list expects 0 arguments, received 1"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -363,6 +412,9 @@ console.error("err");
                 .collect::<Vec<_>>(),
             ["basic_tools", "my_ext", "web_access", "todo", "state_probe"]
         );
+        let description = executor.tool_defs().remove(0).description;
+        assert!(description.contains(r#""name":"list""#));
+        assert!(description.contains(r#""parameters":[]"#));
     }
 
     #[tokio::test]
@@ -372,7 +424,7 @@ console.error("err");
         let error = executor
             .execute(
                 SessionId::next(),
-                r#"import { bash } from "basic_tools"; await bash({ nope: true });"#,
+                r#"import { bash } from "basic_tools"; await bash(undefined);"#,
             )
             .await
             .unwrap_err()
@@ -406,10 +458,10 @@ console.error("err");
         let second = SessionId::next();
         let remember = |value: &str| {
             format!(
-                "import {{ remember }} from 'state_probe'; console.log(await remember({{ value: {value:?} }}));"
+                "import {{ remember }} from 'state_probe'; console.log(await remember({value:?}));"
             )
         };
-        let recall = "import { recall } from 'state_probe'; console.log(await recall({}));";
+        let recall = "import { recall } from 'state_probe'; console.log(await recall());";
         assert_eq!(
             executor
                 .execute(first, &remember("a"))
@@ -432,7 +484,7 @@ console.error("err");
         let executor = built_executor();
         let run = executor.execute(
             SessionId::next(),
-            "import { bash } from 'basic_tools'; await bash({ command: 'sleep 30' });",
+            "import { bash } from 'basic_tools'; await bash('sleep 30');",
         );
         let cancel = async {
             tokio::time::sleep(Duration::from_millis(100)).await;

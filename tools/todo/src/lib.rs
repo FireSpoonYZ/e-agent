@@ -7,7 +7,7 @@ use e_agent_extension::extension;
 
 #[extension(
     description = "Manage a session-scoped todo list: create or replace the list, update item statuses, inspect all items, and clear the list.",
-    system_prompt = "Use the todo tools proactively when working on complex, non-trivial, or multi-step tasks, when the user explicitly requests a todo list, or when the user provides multiple tasks. Skip them for a single straightforward task, work that takes fewer than three trivial steps, or purely conversational or informational requests. Create a concise list of specific, actionable tasks before starting work, and check the current list first to avoid duplicate tasks. Keep exactly one task in_progress while working unless tasks are being performed in parallel. Mark a task in_progress before starting it and completed immediately after it is fully finished; do not batch status updates or mark work completed while relevant tests or checks are failing. After completing a task, use list to check overall progress and identify the next pending task, and revise the list when new work is discovered or the plan changes. The item index is zero-based, and valid statuses are pending, in_progress, and completed. Every todo tool prints the complete current list as YAML; treat the latest printed snapshot as the source of truth."
+    system_prompt = "Use the todo tools proactively when working on complex, non-trivial, or multi-step tasks, when the user explicitly requests a todo list, or when the user provides multiple tasks. Skip them for a single straightforward task, work that takes fewer than three trivial steps, or purely conversational or informational requests. Create a concise list of specific, actionable tasks before starting work, and check the current list first to avoid duplicate tasks. Keep exactly one task in_progress while working unless tasks are being performed in parallel. Mark a task in_progress before starting it and completed immediately after it is fully finished; do not batch status updates or mark work completed while relevant tests or checks are failing. After completing a task, use list to check overall progress and identify the next pending task, and revise the list when new work is discovered or the plan changes. The item index is zero-based, and valid statuses are pending, in_progress, and completed. Every todo tool prints the complete current list as YAML; treat the latest printed snapshot as the source of truth. An empty list is set when session start."
 )]
 mod todo {
     use anyhow::{Context, Result};
@@ -46,12 +46,6 @@ mod todo {
         items: Vec<TodoItem>,
     }
 
-    fn print_yaml(items: &[TodoItem]) -> Result<()> {
-        let yaml = serde_yaml::to_string(items).context("failed to serialize todo list as YAML")?;
-        print!("{yaml}");
-        Ok(())
-    }
-
     #[tool]
     /// Replace the current session's todo list with the supplied tasks.
     ///
@@ -73,7 +67,7 @@ mod todo {
             })
             .collect();
 
-        print_yaml(&state.items)
+        Ok(())
     }
 
     #[tool]
@@ -95,7 +89,7 @@ mod todo {
             .context("todo item index out of range")?
             .status = status;
 
-        print_yaml(&state.items)
+        Ok(())
     }
 
     #[tool]
@@ -114,8 +108,7 @@ mod todo {
     /// to `list`.
     async fn clear(#[state] state: &mut TodoList) -> Result<()> {
         state.items.clear();
-
-        print_yaml(&state.items)
+        Ok(())
     }
 
     #[cfg(test)]

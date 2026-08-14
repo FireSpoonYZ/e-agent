@@ -13,7 +13,8 @@ mod tools;
 
 pub use error::{Error, Result};
 pub use runtime::{
-    NativeCall, NativeCallFuture, NativeModule, PiJsRuntime, PiJsRuntimeConfig, ProgramOutput,
+    NativeCall, NativeCallFuture, NativeFunction, NativeModule, PiJsRuntime, PiJsRuntimeConfig,
+    ProgramOutput,
 };
 
 /// Run one JavaScript/TypeScript module with native extension modules.

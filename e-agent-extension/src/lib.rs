@@ -33,6 +33,7 @@ pub struct ToolFunction {
     pub name: String,
     pub description: String,
     pub requires_await: bool,
+    pub parameters: Vec<String>,
     pub schema: Value,
     pub output_schema: Value,
 }
@@ -55,6 +56,7 @@ pub trait Tool {
 
     const NAME: &'static str;
     const DESCRIPTION: &'static str;
+    const PARAMETERS: &'static [&'static str];
 
     fn call(input: Self::Input) -> impl Future<Output = Result<Self::Output>> + Send + 'static;
 }
@@ -64,6 +66,10 @@ pub fn tool_function<T: Tool>() -> Result<ToolFunction> {
         name: T::NAME.to_string(),
         description: T::DESCRIPTION.to_string(),
         requires_await: true,
+        parameters: T::PARAMETERS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
         schema: serde_json::to_value(schemars::schema_for!(T::Input))?,
         output_schema: serde_json::to_value(schemars::schema_for!(T::Output))?,
     })

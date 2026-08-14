@@ -16603,7 +16603,14 @@ pub type NativeCall =
 #[derive(Clone, Debug)]
 pub struct NativeModule {
     pub name: String,
-    pub functions: Vec<String>,
+    pub functions: Vec<NativeFunction>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeFunction {
+    pub name: String,
+    pub parameters: Vec<String>,
+    pub required_parameters: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -17196,15 +17203,47 @@ globalThis.console = {
             let module_name = serde_json::to_string(&module.name)?;
             let mut source = String::new();
             for function in &module.functions {
-                if !is_js_identifier(function) {
+                if !is_js_identifier(&function.name) {
                     return Err(Error::extension(format!(
-                        "native tool name is not a JavaScript identifier: {function}"
+                        "native tool name is not a JavaScript identifier: {}",
+                        function.name
                     )));
                 }
-                let function_name = serde_json::to_string(function)?;
+                let function_name = serde_json::to_string(&function.name)?;
+                let arguments = (0..function.parameters.len())
+                    .map(|index| format!("arg{index}"))
+                    .collect::<Vec<_>>();
+                let expected_arguments =
+                    if function.required_parameters == function.parameters.len() {
+                        function.parameters.len().to_string()
+                    } else {
+                        format!(
+                            "{}-{}",
+                            function.required_parameters,
+                            function.parameters.len()
+                        )
+                    };
+                let arity_check = format!(
+                    "if (arguments.length < {} || arguments.length > {}) throw new TypeError(\"{}.{} expects {expected_arguments} arguments, received \" + arguments.length);",
+                    function.required_parameters,
+                    function.parameters.len(),
+                    module.name,
+                    function.name,
+                );
+                let input = function
+                    .parameters
+                    .iter()
+                    .zip(&arguments)
+                    .map(|(parameter, argument)| {
+                        Ok(format!("{}: {argument}", serde_json::to_string(parameter)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 writeln!(
                     source,
-                    "export async function {function}(input) {{ return JSON.parse(await globalThis.__e_agent_native_call({module_name}, {function_name}, JSON.stringify(input))); }}"
+                    "export async function {}({}) {{ {arity_check} return JSON.parse(await globalThis.__e_agent_native_call({module_name}, {function_name}, JSON.stringify({{{}}}))); }}",
+                    function.name,
+                    arguments.join(", "),
+                    input.join(", "),
                 )
                 .expect("writing to String cannot fail");
             }

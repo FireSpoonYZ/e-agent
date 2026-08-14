@@ -463,6 +463,7 @@ fn expand_tool(
 
                 const NAME: &'static str = stringify!(#name);
                 const DESCRIPTION: &'static str = #description;
+                const PARAMETERS: &'static [&'static str] = &[#(stringify!(#input_fields)),*];
 
                 async fn call(input: Self::Input) -> ::e_agent_extension::Result<Self::Output> {
                     let Input { #(#input_fields,)* } = input;

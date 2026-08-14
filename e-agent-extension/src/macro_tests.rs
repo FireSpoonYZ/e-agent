@@ -108,6 +108,8 @@ fn exports_extension_metadata() {
         "Remember one value and return the whole list."
     );
     assert!(extension.functions.iter().all(|tool| tool.requires_await));
+    assert_eq!(extension.functions[0].parameters, ["value", "label"]);
+    assert!(extension.functions[1].parameters.is_empty());
     assert_eq!(
         extension.functions[0].schema["properties"]["value"]["description"],
         "Value to remember"
