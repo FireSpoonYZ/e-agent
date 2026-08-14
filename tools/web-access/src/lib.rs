@@ -1,10 +1,7 @@
-#[path = "web_fetch.rs"]
-mod web_fetch_impl;
 #[path = "web_search.rs"]
 mod web_search_impl;
 
 use e_agent_extension::{Result, extension};
-use web_fetch_impl::SearchResult;
 use web_search_impl::SearxngSearchResponse;
 
 #[extension(
@@ -37,18 +34,5 @@ mod web_access {
             accept_invalid_certs,
         )
         .await
-    }
-
-    #[tool]
-    /// Fetch web search results through the websearch SearXNG provider.
-    async fn web_fetch(
-        #[desc("The search query text")] query: String,
-        #[desc("Maximum number of results to return")] max_results: Option<u32>,
-        #[desc("Language/locale for results")] language: Option<String>,
-        #[desc("Country/region for results")] region: Option<String>,
-        #[desc("Result page number (for pagination)")] page: Option<u32>,
-        #[desc("Custom timeout in milliseconds")] timeout: Option<u64>,
-    ) -> Result<Vec<SearchResult>> {
-        web_fetch_impl::run(query, max_results, language, region, page, timeout).await
     }
 }

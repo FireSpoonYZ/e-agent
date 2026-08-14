@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use async_openai::{
     Client,
     config::OpenAIConfig,
@@ -13,6 +15,7 @@ use async_openai::{
         },
     },
 };
+use url::Url;
 
 use super::Provider;
 use crate::message::{
@@ -25,20 +28,21 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
+        let host = std::env::var("OPENAI_BASE_URL")
+            .unwrap_or_else(|_e| String::from("https://api.openai.com/v1"));
+
+        let url = Url::from_str(&host).context("parse OPENAI_BASE_URL failed")?;
+        let host = url.host().context("no host found in OPENAI_BASE_URL")?;
+
         let http_client = reqwest::ClientBuilder::new()
+            .retry(reqwest::retry::for_host(host.to_string()))
             .user_agent("codex_cli_rs/0.125.0")
             .build()
-            .unwrap();
+            .context("create reqwest client falied")?;
         let client = Client::new().with_http_client(http_client);
 
-        Self { client }
-    }
-}
-
-impl Default for OpenAIProvider {
-    fn default() -> Self {
-        Self::new()
+        Ok(Self { client })
     }
 }
 

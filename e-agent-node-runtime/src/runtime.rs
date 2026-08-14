@@ -17152,24 +17152,19 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from(Async(move |module: String, tool: String, input: String| {
                         let dispatcher = dispatcher.clone();
                         async move {
-                            let input = serde_json::from_str(&input).map_err(|error| {
+                            let result = match serde_json::from_str(&input) {
+                                Ok(input) => dispatcher(module, tool, input).await,
+                                Err(error) => {
+                                    Err(format!("invalid native extension input: {error}"))
+                                }
+                            };
+                            serde_json::to_string(&match result {
+                                Ok(output) => serde_json::json!({ "result": output }),
+                                Err(error) => serde_json::json!({ "error": error }),
+                            })
+                            .map_err(|error| {
                                 rquickjs::Error::new_into_js_message(
-                                    "JSON",
-                                    "native extension input",
-                                    error.to_string(),
-                                )
-                            })?;
-                            let output =
-                                dispatcher(module, tool, input).await.map_err(|error| {
-                                    rquickjs::Error::new_into_js_message(
-                                        "native extension",
-                                        "tool call",
-                                        error,
-                                    )
-                                })?;
-                            serde_json::to_string(&output).map_err(|error| {
-                                rquickjs::Error::new_into_js_message(
-                                    "native extension output",
+                                    "native extension result",
                                     "JSON",
                                     error.to_string(),
                                 )
@@ -17240,7 +17235,7 @@ globalThis.console = {
                     .collect::<Result<Vec<_>>>()?;
                 writeln!(
                     source,
-                    "export async function {}({}) {{ {arity_check} return JSON.parse(await globalThis.__e_agent_native_call({module_name}, {function_name}, JSON.stringify({{{}}}))); }}",
+                    "export async function {}({}) {{ {arity_check} const response = JSON.parse(await globalThis.__e_agent_native_call({module_name}, {function_name}, JSON.stringify({{{}}}))); if (response.error !== undefined) throw new Error(response.error); return response.result; }}",
                     function.name,
                     arguments.join(", "),
                     input.join(", "),

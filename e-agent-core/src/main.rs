@@ -19,11 +19,12 @@ struct Cli {
     /// 要发送给 agent 的提示词
     prompt: String,
 }
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     dotenvy::dotenv().context("load .env failed")?;
-    let provider = OpenAIProvider::new();
+    let provider = OpenAIProvider::new().context("create openai provider failed")?;
     let mut tool_executor = ProgrammaticToolExecutor::default();
     let tool_paths = std::env::var_os("E_AGENT_TOOL_PATHS")
         .ok_or_else(|| anyhow!("E_AGENT_TOOL_PATHS is not set"))?;

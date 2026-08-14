@@ -287,9 +287,10 @@ fn validate_metadata(extension: &ToolExtension) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, process::Command};
+    use std::{path::PathBuf, process::Command, sync::Arc};
 
     use e_agent_extension::SessionId;
+    use e_agent_node_runtime::{NativeCall, NativeFunction, NativeModule, execute_program};
 
     use crate::tool::ToolExecutor;
 
@@ -363,6 +364,35 @@ console.error("err");
         let output = executor.execute(SessionId::next(), &code).await.unwrap();
         assert_eq!(output.stdout, "file.txt file-data node\n");
         assert_eq!(output.stderr, "err\n");
+    }
+
+    #[tokio::test]
+    async fn preserves_long_native_tool_errors() {
+        let marker = "native-error-tail-marker";
+        let message = format!("{}{marker}", "x".repeat(512));
+        let call: NativeCall = Arc::new(move |_, _, _| {
+            let message = message.clone();
+            Box::pin(async move { Err(message) })
+        });
+        let modules = [NativeModule {
+            name: "long_error".to_string(),
+            functions: vec![NativeFunction {
+                name: "fail".to_string(),
+                parameters: Vec::new(),
+                required_parameters: 0,
+            }],
+        }];
+
+        let error = execute_program(
+            "import { fail } from \"long_error\"; await fail();",
+            &modules,
+            call,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(marker), "truncated error: {error}");
     }
 
     #[tokio::test]
