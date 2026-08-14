@@ -31,6 +31,7 @@ swc_ecma_transforms_base = "37.0.0"
 swc_ecma_transforms_typescript = "41.0.0"
 swc_ecma_visit = "20.0.0"
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt"] }
 tracing = "0.1"
 uuid = { version = "1.21.0", features = ["v4"] }
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
@@ -45,4 +46,3 @@ wasm-host = []
 futures = "0.3"
 proptest = "1.10"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }

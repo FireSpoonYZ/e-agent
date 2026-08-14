@@ -17299,6 +17299,35 @@ globalThis.console = {
         }
     }
 
+    /// Run a module while dispatching hostcalls produced by its top-level await chain.
+    pub async fn execute_program_with_hostcalls<F, Fut>(
+        &self,
+        source: &str,
+        mut dispatch: F,
+    ) -> Result<ProgramOutput>
+    where
+        F: FnMut(HostcallRequest) -> Fut,
+        Fut: Future<Output = Vec<HostcallOutcome>>,
+    {
+        let program = self.execute_program(source);
+        tokio::pin!(program);
+
+        loop {
+            while let Some(request) = self.drain_hostcall_requests().pop_front() {
+                let call_id = request.call_id.clone();
+                for outcome in dispatch(request).await {
+                    self.complete_hostcall(call_id.clone(), outcome);
+                    self.tick().await?;
+                }
+            }
+
+            tokio::select! {
+                result = &mut program => return result,
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    }
+
     /// Evaluate JavaScript source code.
     pub async fn eval(&self, source: &str) -> Result<()> {
         self.interrupt_budget.reset();

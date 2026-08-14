@@ -13,9 +13,10 @@ mod tools;
 
 pub use error::{Error, Result};
 pub use runtime::{
-    NativeCall, NativeCallFuture, NativeFunction, NativeModule, PiJsRuntime, PiJsRuntimeConfig,
-    ProgramOutput,
+    HostcallKind, HostcallRequest, NativeCall, NativeCallFuture, NativeFunction, NativeModule,
+    PiJsRuntime, PiJsRuntimeConfig, ProgramOutput,
 };
+pub use scheduler::HostcallOutcome;
 
 /// Run one JavaScript/TypeScript module with native extension modules.
 pub async fn execute_program(
@@ -26,6 +27,24 @@ pub async fn execute_program(
     let runtime = PiJsRuntime::new().await?;
     runtime.install_native_modules(modules, call).await?;
     runtime.execute_program(source).await
+}
+
+/// Run one module and dispatch hostcalls while its top-level Promise is pending.
+pub async fn execute_program_with_hostcalls<F, Fut>(
+    source: &str,
+    modules: &[NativeModule],
+    call: NativeCall,
+    dispatch: F,
+) -> Result<ProgramOutput>
+where
+    F: FnMut(HostcallRequest) -> Fut,
+    Fut: std::future::Future<Output = Vec<HostcallOutcome>>,
+{
+    let runtime = PiJsRuntime::new().await?;
+    runtime.install_native_modules(modules, call).await?;
+    runtime
+        .execute_program_with_hostcalls(source, dispatch)
+        .await
 }
 
 /// Run JavaScript in a fresh Node-compatible QuickJS runtime.

@@ -86,15 +86,14 @@ Native extension calls such as the `todo` module do not reproduce the issue
 because they use the separately installed native-call bridge and are awaited
 directly by Rust.
 
-## Resolution direction
+## Resolution
 
-The short-term workaround is to run Git and other subprocess commands through
-the host's `bash` tool instead of `node:child_process` inside PTC programs.
+The diagnosis above is confirmed. The PTC path now uses a hostcall-driven execution
+loop: while the module Promise is pending, it drains requests, executes supported
+`Exec` requests, delivers stream/final completions, and ticks the PiJS scheduler.
+Therefore asynchronous `node:child_process` calls such as
+`await promisify(execFile)(...)` no longer deadlock in PTC.
 
-Full `child_process` support requires the PTC execution path to drive the
-hostcall queue while the module Promise is pending: drain queued requests,
-execute permitted subprocesses, stream output when requested, call
-`complete_hostcall()`, and tick the PiJS scheduler until both the program and
-all relevant hostcalls settle. If PTC is not intended to support exec
-hostcalls, `node:child_process` should instead fail immediately with a clear
-unsupported-operation error rather than leaving an unresolved Promise.
+The PTC adapter currently supports `Exec` hostcalls only. Other hostcall kinds fail
+immediately with an `unsupported` error. Synchronous APIs remain separately gated by
+`allow_unsafe_sync_exec`, whose default is `false`.

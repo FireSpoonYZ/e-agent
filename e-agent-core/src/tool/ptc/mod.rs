@@ -9,7 +9,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use e_agent_extension::{AbiBuffer, EXTENSION_ABI_VERSION, ExtensionV1, SessionId, ToolExtension};
 use e_agent_node_runtime::{
-    NativeCall, NativeFunction, NativeModule, ProgramOutput, execute_program,
+    HostcallKind, HostcallOutcome, HostcallRequest, NativeCall, NativeFunction, NativeModule,
+    ProgramOutput, execute_program_with_hostcalls,
 };
 use libloading::Library;
 use serde::Serialize;
@@ -194,10 +195,59 @@ impl ProgrammaticToolExecutor {
             })
         });
 
-        let ProgramOutput { stdout, stderr } = execute_program(code, &modules, call)
-            .await
-            .map_err(anyhow::Error::new)?;
+        let ProgramOutput { stdout, stderr } =
+            execute_program_with_hostcalls(code, &modules, call, execute_hostcall)
+                .await
+                .map_err(anyhow::Error::new)?;
         Ok(PTCOutput { stdout, stderr })
+    }
+}
+
+async fn execute_hostcall(request: HostcallRequest) -> Vec<HostcallOutcome> {
+    let method = request.method();
+    let HostcallKind::Exec { cmd } = request.kind else {
+        return vec![HostcallOutcome::Error {
+            code: "unsupported".to_string(),
+            message: format!("PTC does not support {method} hostcalls"),
+        }];
+    };
+
+    let args = request.payload["args"]
+        .as_array()
+        .map(|args| args.iter().filter_map(serde_json::Value::as_str))
+        .into_iter()
+        .flatten();
+    let mut command = tokio::process::Command::new(cmd);
+    command.args(args);
+    if let Some(cwd) = request.payload["options"]["cwd"].as_str() {
+        command.current_dir(cwd);
+    }
+
+    match command.output().await {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            vec![
+                HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: serde_json::json!({ "stdout": stdout, "stderr": stderr }),
+                    is_final: false,
+                },
+                HostcallOutcome::Success(serde_json::json!({
+                    "code": output.status.code(),
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "killed": false,
+                    "signal": null,
+                })),
+            ]
+        }
+        Err(error) => vec![HostcallOutcome::Error {
+            code: error
+                .raw_os_error()
+                .map_or_else(|| "exec".to_string(), |code| code.to_string()),
+            message: error.to_string(),
+        }],
     }
 }
 
@@ -364,6 +414,28 @@ console.error("err");
         let output = executor.execute(SessionId::next(), &code).await.unwrap();
         assert_eq!(output.stdout, "file.txt file-data node\n");
         assert_eq!(output.stderr, "err\n");
+    }
+
+    #[tokio::test]
+    async fn awaits_async_child_process_hostcalls() {
+        let _guard = TEST_EXECUTION.lock().await;
+        let executor = ProgrammaticToolExecutor::default();
+        #[cfg(windows)]
+        let (command, args) = ("cmd", serde_json::json!(["/C", "echo", "hostcall-ok"]));
+        #[cfg(not(windows))]
+        let (command, args) = ("printf", serde_json::json!(["hostcall-ok\\n"]));
+        let code = format!(
+            r#"
+import {{ execFile }} from "node:child_process";
+import {{ promisify }} from "node:util";
+const stdout = await promisify(execFile)({command:?}, {args});
+console.log(stdout.trim());
+"#
+        );
+
+        let output = executor.execute(SessionId::next(), &code).await.unwrap();
+        assert_eq!(output.stdout, "hostcall-ok\n");
+        assert!(output.stderr.is_empty());
     }
 
     #[tokio::test]
