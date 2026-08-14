@@ -1,0 +1,13 @@
+error: #[state] parameter requires a #[state] struct in the same #[extension] module
+ --> tests/compile-fail/state_without_struct.rs:9:24
+  |
+9 |     pub async fn touch(#[state] state: &u8) -> Result<u8> {
+  |                        ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Result`
+ --> tests/compile-fail/state_without_struct.rs:1:25
+  |
+1 | use e_agent_extension::{Result, extension};
+  |                         ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

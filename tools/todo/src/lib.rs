@@ -3,7 +3,7 @@
 //! The extension lets an agent replace a task list, move individual tasks
 //! through their lifecycle, inspect current progress, and clear the list.
 
-use e_agent_tool::extension;
+use e_agent_extension::extension;
 
 #[extension(
     description = "Manage a session-scoped todo list: create or replace the list, update item statuses, inspect all items, and clear the list.",

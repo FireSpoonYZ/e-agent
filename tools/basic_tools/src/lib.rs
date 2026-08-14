@@ -13,7 +13,7 @@ mod read_impl;
 #[path = "write.rs"]
 mod write_impl;
 
-use e_agent_tool::{Deserialize, JsonSchema, Result, extension};
+use e_agent_extension::{Deserialize, JsonSchema, Result, extension};
 use serde_json::Value;
 
 #[derive(Clone, Deserialize, JsonSchema)]

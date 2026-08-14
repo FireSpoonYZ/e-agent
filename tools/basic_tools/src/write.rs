@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use e_agent_tool::Result;
+use e_agent_extension::Result;
 
 use crate::mutation;
 

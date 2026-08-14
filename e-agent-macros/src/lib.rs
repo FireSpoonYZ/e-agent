@@ -170,8 +170,8 @@ fn expand_extension(
     let state_items = state_struct.as_ref().map(|state| {
         quote! {
             #[doc(hidden)]
-            pub(crate) static __E_AGENT_STATES: ::e_agent_tool::SessionStates<#state> =
-                ::e_agent_tool::SessionStates::new();
+            pub(crate) static __E_AGENT_STATES: ::e_agent_extension::SessionStates<#state> =
+                ::e_agent_extension::SessionStates::new();
 
             /// Extension state is shared across sessions and threads.
             const _: fn() = || {
@@ -181,13 +181,13 @@ fn expand_extension(
         }
     });
     let drop_state = if state_items.is_some() {
-        quote!(__E_AGENT_STATES.drop_session(::e_agent_tool::SessionId(session));)
+        quote!(__E_AGENT_STATES.drop_session(::e_agent_extension::SessionId(session));)
     } else {
         quote!(let _ = session;)
     };
 
     let name = &module.ident;
-    let python_name = syn::LitStr::new(&name.to_string(), name.span());
+    let extension_name = syn::LitStr::new(&name.to_string(), name.span());
     let visibility = &module.vis;
     let attributes = &module.attrs;
 
@@ -198,75 +198,97 @@ fn expand_extension(
 
             #state_items
 
-            /// Set or clear the cancellation flag for this extension.
-            ///
-            /// A cdylib links its own copy of the tool runtime, so the host
-            /// cannot reach these statics directly and drives them through
-            /// Python instead.
-            #[::e_agent_tool::__private::pyo3::pyfunction]
-            #[pyo3(name = "_set_cancelled")]
-            pub fn __e_agent_set_cancelled(cancelled: bool) {
-                if cancelled {
-                    ::e_agent_tool::cancel();
-                } else {
-                    ::e_agent_tool::reset();
-                }
-            }
-
-            /// Bind the session whose state stateful tools should use.
-            #[::e_agent_tool::__private::pyo3::pyfunction]
-            #[pyo3(name = "__e_agent_set_session__")]
-            pub fn __e_agent_set_session(session: u64) {
-                ::e_agent_tool::set_current_session(::e_agent_tool::SessionId(session));
-            }
-
-            /// Unbind the current session.
-            #[::e_agent_tool::__private::pyo3::pyfunction]
-            #[pyo3(name = "__e_agent_clear_session__")]
-            pub fn __e_agent_clear_session() {
-                ::e_agent_tool::clear_current_session();
-            }
-
-            /// Drop one session's state, keeping every other session intact.
-            #[::e_agent_tool::__private::pyo3::pyfunction]
-            #[pyo3(name = "__e_agent_drop_session__")]
-            pub fn __e_agent_drop_session(session: u64) {
-                #drop_state
-            }
-
-            #[::e_agent_tool::__private::pyo3::pymodule(name = #python_name)]
-            fn __e_agent_pymodule(
-                module: &::e_agent_tool::__private::pyo3::Bound<
-                    '_,
-                    ::e_agent_tool::__private::pyo3::types::PyModule
-                >,
-            ) -> ::e_agent_tool::__private::pyo3::PyResult<()> {
-                use ::e_agent_tool::__private::pyo3::types::PyModuleMethods as _;
-
-                module.add_function(::e_agent_tool::__private::pyo3::wrap_pyfunction!(
-                    __e_agent_set_cancelled, module)?)?;
-                module.add_function(::e_agent_tool::__private::pyo3::wrap_pyfunction!(
-                    __e_agent_set_session, module)?)?;
-                module.add_function(::e_agent_tool::__private::pyo3::wrap_pyfunction!(
-                    __e_agent_clear_session, module)?)?;
-                module.add_function(::e_agent_tool::__private::pyo3::wrap_pyfunction!(
-                    __e_agent_drop_session, module)?)?;
-                #(module.add_function(::e_agent_tool::__private::pyo3::wrap_pyfunction!(
-                    #tools::python, module)?)?;)*
-
-                let functions = vec![#(::e_agent_tool::tool_function::<#tools::Definition>()
-                    .map_err(|err| ::e_agent_tool::__private::pyo3::exceptions::PyValueError::new_err(
-                        format!("{err:#}")))?),*];
-                let extension = ::e_agent_tool::ToolExtension {
-                    name: #python_name.to_string(),
+            unsafe extern "C" fn __e_agent_metadata() -> ::e_agent_extension::AbiBuffer {
+                let functions = vec![#(::e_agent_extension::tool_function::<#tools::Definition>()
+                    .expect("generated tool metadata must serialize")),*];
+                let extension = ::e_agent_extension::ToolExtension {
+                    name: #extension_name.to_string(),
                     description: #description.to_string(),
                     system_prompt: #system_prompt.to_string(),
                     functions,
                 };
-                let metadata = ::e_agent_tool::__private::serde_json::to_string(&extension)
-                    .map_err(|err| ::e_agent_tool::__private::pyo3::exceptions::PyValueError::new_err(
-                        err.to_string()))?;
-                module.add("__e_agent_extension__", metadata)
+                ::e_agent_extension::AbiBuffer::from_string(
+                    ::e_agent_extension::__private::serde_json::to_string(&extension)
+                        .expect("generated extension metadata must serialize")
+                )
+            }
+
+            unsafe extern "C" fn __e_agent_start_call(
+                session: u64,
+                tool_ptr: *const u8,
+                tool_len: usize,
+                input_ptr: *const u8,
+                input_len: usize,
+                callback: ::e_agent_extension::CompletionCallback,
+                user_data: *mut ::std::ffi::c_void,
+            ) {
+                if (tool_ptr.is_null() && tool_len != 0)
+                    || (input_ptr.is_null() && input_len != 0)
+                {
+                    unsafe {
+                        callback(
+                            user_data,
+                            ::e_agent_extension::AbiBuffer::from_string("invalid null input buffer".into()),
+                            true,
+                        );
+                    }
+                    return;
+                }
+                let tool_bytes = unsafe { ::std::slice::from_raw_parts(tool_ptr, tool_len) };
+                let input = unsafe { ::std::slice::from_raw_parts(input_ptr, input_len) };
+                let tool = match ::std::str::from_utf8(tool_bytes) {
+                    Ok(tool) => tool,
+                    Err(error) => {
+                        unsafe {
+                            callback(
+                                user_data,
+                                ::e_agent_extension::AbiBuffer::from_string(format!("invalid tool name: {error}")),
+                                true,
+                            );
+                        }
+                        return;
+                    }
+                };
+                match tool {
+                    #(stringify!(#tools) => unsafe {
+                        ::e_agent_extension::start_tool_call::<#tools::Definition>(
+                            session, input, callback, user_data
+                        )
+                    },)*
+                    _ => unsafe {
+                        callback(
+                            user_data,
+                            ::e_agent_extension::AbiBuffer::from_string(format!("unknown tool: {tool}")),
+                            true,
+                        );
+                    },
+                }
+            }
+
+            unsafe extern "C" fn __e_agent_drop_session(session: u64) {
+                #drop_state
+            }
+
+            unsafe extern "C" fn __e_agent_set_cancelled(cancelled: bool) {
+                if cancelled {
+                    ::e_agent_extension::cancel();
+                } else {
+                    ::e_agent_extension::reset();
+                }
+            }
+
+            #[cfg(not(test))]
+            #[unsafe(no_mangle)]
+            pub extern "C" fn e_agent_extension_v1() -> *const ::e_agent_extension::ExtensionV1 {
+                static DESCRIPTOR: ::e_agent_extension::ExtensionV1 = ::e_agent_extension::ExtensionV1 {
+                    abi_version: ::e_agent_extension::EXTENSION_ABI_VERSION,
+                    metadata: __e_agent_metadata,
+                    start_call: __e_agent_start_call,
+                    drop_session: __e_agent_drop_session,
+                    set_cancelled: __e_agent_set_cancelled,
+                    free_buffer: ::e_agent_extension::free_buffer,
+                };
+                &DESCRIPTOR
             }
         }
     })
@@ -337,7 +359,6 @@ fn expand_tool(
     }
 
     let name = &function.sig.ident;
-    let python_name = syn::LitStr::new(&name.to_string(), proc_macro2::Span::call_site());
     let visibility = &function.vis;
     let description = docs(&function.attrs);
     let doc_attributes: Vec<_> = function
@@ -353,8 +374,6 @@ fn expand_tool(
         }
     }
     let mut fields = Vec::new();
-    let mut python_fields = Vec::new();
-    let mut python_signature = Vec::new();
     let mut input_fields = Vec::new();
     let mut call_arguments = Vec::new();
     let mut state = None::<StateParam>;
@@ -403,28 +422,6 @@ fn expand_tool(
         saw_optional |= optional;
         let attrs = field_attributes(&argument.attrs)?;
         fields.push(quote!(#(#attrs)* #ident: #ty));
-        python_fields.push(if optional {
-            quote!(
-                #ident: ::std::option::Option<
-                    ::e_agent_tool::__private::pyo3::Bound<
-                        '_,
-                        ::e_agent_tool::__private::pyo3::PyAny
-                    >
-                >
-            )
-        } else {
-            quote!(
-                #ident: ::e_agent_tool::__private::pyo3::Bound<
-                    '_,
-                    ::e_agent_tool::__private::pyo3::PyAny
-                >
-            )
-        });
-        python_signature.push(if optional {
-            quote!(#ident = None)
-        } else {
-            quote!(#ident)
-        });
         input_fields.push(ident.clone());
         call_arguments.push(quote!(#ident));
     }
@@ -450,8 +447,8 @@ fn expand_tool(
             use super::*;
 
             #[derive(
-                ::e_agent_tool::__private::schemars::JsonSchema,
-                ::e_agent_tool::__private::serde::Deserialize
+                ::e_agent_extension::__private::schemars::JsonSchema,
+                ::e_agent_extension::__private::serde::Deserialize
             )]
             #[serde(deny_unknown_fields)]
             pub(crate) struct Input {
@@ -460,36 +457,18 @@ fn expand_tool(
 
             pub(crate) struct Definition;
 
-            impl ::e_agent_tool::Tool for Definition {
+            impl ::e_agent_extension::Tool for Definition {
                 type Input = Input;
                 type Output = #output;
 
                 const NAME: &'static str = stringify!(#name);
                 const DESCRIPTION: &'static str = #description;
 
-                async fn call(input: Self::Input) -> ::e_agent_tool::Result<Self::Output> {
+                async fn call(input: Self::Input) -> ::e_agent_extension::Result<Self::Output> {
                     let Input { #(#input_fields,)* } = input;
                     #state_binding
                     super::#name(#(#call_arguments),*).await
                 }
-            }
-
-            #[::e_agent_tool::__private::pyo3::pyfunction(
-                name = #python_name,
-                signature = (#(#python_signature),*)
-            )]
-            pub(crate) fn python(
-                py: ::e_agent_tool::__private::pyo3::Python,
-                #(#python_fields,)*
-            ) -> ::e_agent_tool::__private::pyo3::PyResult<
-                ::e_agent_tool::__private::pyo3::Py<::e_agent_tool::__private::pyo3::PyAny>
-            > {
-                use ::e_agent_tool::__private::pyo3::types::PyDictMethods as _;
-
-                let input = ::e_agent_tool::__private::pyo3::types::PyDict::new(py);
-                #(input.set_item(stringify!(#input_fields), #input_fields)?;)*
-                let input = ::e_agent_tool::input_from_python::<Input>(py, &input)?;
-                ::e_agent_tool::run::<Definition>(py, input)
             }
         }
     })

@@ -1,0 +1,13 @@
+error: #[state] parameter type must be `Store`
+  --> tests/compile-fail/wrong_state_type.rs:16:40
+   |
+16 |     pub async fn touch(#[state] state: &Other) -> Result<u8> {
+   |                                        ^^^^^^
+
+warning: unused import: `Result`
+ --> tests/compile-fail/wrong_state_type.rs:1:25
+  |
+1 | use e_agent_extension::{Result, extension};
+  |                         ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

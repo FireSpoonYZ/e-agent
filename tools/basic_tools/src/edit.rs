@@ -1,4 +1,4 @@
-use e_agent_tool::{Result, anyhow};
+use e_agent_extension::{Result, anyhow};
 use serde_json::json;
 
 use crate::{Replacement, diff, fuzzy, mutation};

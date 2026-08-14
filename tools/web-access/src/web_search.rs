@@ -1,4 +1,4 @@
-use e_agent_tool::{Context, JsonSchema, Result, Serialize};
+use e_agent_extension::{Context, JsonSchema, Result, Serialize};
 use serde::Deserialize;
 
 /// Search the web through the configured SearXNG instance.

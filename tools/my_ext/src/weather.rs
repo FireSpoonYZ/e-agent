@@ -1,4 +1,4 @@
-use e_agent_tool::{Context, Deserialize, Result, Serialize, anyhow};
+use e_agent_extension::{Context, Deserialize, Result, Serialize, anyhow};
 
 pub async fn weather_inner(city: String) -> Result<Weather> {
     let city = city.to_owned();

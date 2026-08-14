@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use e_agent_tool::SessionId;
+use e_agent_extension::SessionId;
 
 use crate::{
     message::{Message, MessageContent, ToolResultMessage, UserMessage},
@@ -144,7 +144,7 @@ fn print_message(content: &[MessageContent]) {
 
 #[cfg(test)]
 mod tests {
-    use e_agent_tool::SessionId;
+    use e_agent_extension::SessionId;
 
     use super::Session;
     use crate::{
@@ -170,7 +170,7 @@ mod tests {
     /// Two extensions whose prompts must stay in load order.
     struct TwoExtensions;
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl ToolExecutor for TwoExtensions {
         type Error = anyhow::Error;
         fn tool_defs(&self) -> Vec<ToolDef> {

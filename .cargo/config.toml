@@ -1,2 +1,0 @@
-[target.x86_64-pc-windows-msvc]
-runner = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "& ((git rev-parse --show-toplevel) + '\\scripts\\run-with-python.ps1')"]

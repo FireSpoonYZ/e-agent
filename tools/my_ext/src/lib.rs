@@ -2,7 +2,7 @@ mod attraction;
 #[path = "weather.rs"]
 mod weather_api;
 
-use e_agent_tool::{Context, JsonSchema, Result, Serialize, extension};
+use e_agent_extension::{Context, JsonSchema, Result, Serialize, extension};
 
 #[derive(JsonSchema, Serialize)]
 /// 指定城市的实时天气

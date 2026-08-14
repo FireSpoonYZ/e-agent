@@ -29,13 +29,9 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("E_AGENT_TOOL_PATHS is not set"))?;
     let tool_paths: Vec<_> = std::env::split_paths(&tool_paths).collect();
     for path in tool_paths {
-        tool_executor.load(&path).map_err(|err| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "load {} failed: {:#}",
-                path.display(),
-                err
-            ))
-        })?;
+        tool_executor
+            .load(&path)
+            .with_context(|| format!("load {} failed", path.display()))?;
     }
 
     let mut session = Session::new(provider, tool_executor, SYSTEM_PROMPT);

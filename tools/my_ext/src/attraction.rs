@@ -1,4 +1,4 @@
-use e_agent_tool::{Context, Result};
+use e_agent_extension::{Context, Result};
 use tavily::{SearchResponse, Tavily};
 
 pub(crate) async fn attraction_inner(city: String, weather: String) -> Result<SearchResponse> {

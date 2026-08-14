@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use e_agent_tool::{Result, anyhow};
+use e_agent_extension::{Result, anyhow};
 #[cfg(windows)]
 use std::path::Path;
 use tokio::{
@@ -78,7 +78,7 @@ pub async fn run(command: String, timeout: Option<f64>) -> Result<String> {
         }
         None => match wait(&mut child).await {
             Ok(status) => status,
-            Err(error) if error.is::<e_agent_tool::Cancelled>() => {
+            Err(error) if error.is::<e_agent_extension::Cancelled>() => {
                 cancelled = true;
                 stop(&mut child, pid).await?
             }
@@ -130,14 +130,14 @@ fn separator(output: &str) -> &'static str {
 
 /// Wait for the shell, aborting early when the host cancels the turn.
 async fn wait(child: &mut tokio::process::Child) -> Result<std::process::ExitStatus> {
-    if e_agent_tool::cancelled() {
-        return Err(e_agent_tool::Cancelled.into());
+    if e_agent_extension::cancelled() {
+        return Err(e_agent_extension::Cancelled.into());
     }
-    let mut signal = e_agent_tool::subscribe_cancel();
+    let mut signal = e_agent_extension::subscribe_cancel();
     tokio::select! {
         biased;
         status = child.wait() => Ok(status?),
-        _ = signal.recv() => Err(e_agent_tool::Cancelled.into()),
+        _ = signal.recv() => Err(e_agent_extension::Cancelled.into()),
     }
 }
 

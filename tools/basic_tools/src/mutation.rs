@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock, Weak},
 };
 
-use e_agent_tool::Result;
+use e_agent_extension::Result;
 use tokio::sync::Mutex as AsyncMutex;
 
 static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>> = OnceLock::new();

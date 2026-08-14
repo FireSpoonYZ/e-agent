@@ -3,7 +3,7 @@ mod web_fetch_impl;
 #[path = "web_search.rs"]
 mod web_search_impl;
 
-use e_agent_tool::{Result, extension};
+use e_agent_extension::{Result, extension};
 use web_fetch_impl::SearchResult;
 use web_search_impl::SearxngSearchResponse;
 

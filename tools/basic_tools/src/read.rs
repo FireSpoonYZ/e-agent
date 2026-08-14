@@ -1,5 +1,5 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
-use e_agent_tool::{Result, anyhow};
+use e_agent_extension::{Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::mutation;

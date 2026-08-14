@@ -1,6 +1,6 @@
 //! Stateful extension used by the host's session-state tests.
 
-use e_agent_tool::{Result, extension};
+use e_agent_extension::{Result, extension};
 
 #[extension(
     description = "Remember values per session",

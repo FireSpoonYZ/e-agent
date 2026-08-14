@@ -355,7 +355,7 @@ mod tests {
         OutputItem::FunctionCall(FunctionToolCall {
             arguments: arguments.into(),
             call_id: "call_1".into(),
-            name: "python".into(),
+            name: "node".into(),
             namespace: None,
             id: None,
             status: None,
@@ -380,7 +380,7 @@ mod tests {
                     },
                     MessageContent::ToolUse {
                         id: "call_1".into(),
-                        name: "python".into(),
+                        name: "node".into(),
                         input: r#"{"code":"print(1)"}"#.into(),
                         custom: false,
                         item_id: None,
@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(json_tool["parameters"]["type"], "object");
 
         let text_tool = serde_json::to_value(to_tool(&ToolDef {
-            name: "python".into(),
+            name: "node".into(),
             description: "Run Python".into(),
             input: ToolInput::Text,
         }))
@@ -430,7 +430,7 @@ mod tests {
         assert_eq!(text_tool["format"]["type"], "text");
 
         let lark_tool = serde_json::to_value(to_tool(&ToolDef {
-            name: "python".into(),
+            name: "node".into(),
             description: "Run Python".into(),
             input: ToolInput::Lark("start: /.+/".into()),
         }))
@@ -446,7 +446,7 @@ mod tests {
                 "type": "custom_tool_call",
                 "call_id": "call_1",
                 "input": "print(\"a\\nb\")",
-                "name": "python",
+                "name": "node",
                 "id": "ctc_1"
             }))
             .unwrap(),
@@ -465,7 +465,7 @@ mod tests {
             Message::Assistant(AssistantMessage {
                 content: vec![MessageContent::ToolUse {
                     id: "call_1".into(),
-                    name: "python".into(),
+                    name: "node".into(),
                     input: "print(1)".into(),
                     custom: true,
                     item_id: Some("ctc_1".into()),

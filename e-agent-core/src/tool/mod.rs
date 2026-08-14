@@ -1,11 +1,11 @@
 pub mod ptc;
 
-use e_agent_tool::SessionId;
+use e_agent_extension::SessionId;
 use serde::{Deserialize, Serialize};
 
 use crate::message::{MessageContent, ToolDef};
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 pub trait ToolExecutor: Send + Sync {
     type Error: std::fmt::Debug;
     fn tool_defs(&self) -> Vec<ToolDef>;

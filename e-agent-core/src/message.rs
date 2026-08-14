@@ -205,7 +205,7 @@ mod tests {
                     },
                     MessageContent::ToolUse {
                         id: "call_1".into(),
-                        name: "python".into(),
+                        name: "node".into(),
                         input: r#"{"code":"print(1)"}"#.into(),
                         custom: false,
                         item_id: None,

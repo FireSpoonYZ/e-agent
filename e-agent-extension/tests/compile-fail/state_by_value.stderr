@@ -1,0 +1,13 @@
+error: #[state] parameter must be &State or &mut State
+  --> tests/compile-fail/state_by_value.rs:13:40
+   |
+13 |     pub async fn touch(#[state] state: Store) -> Result<u8> {
+   |                                        ^^^^^
+
+warning: unused import: `Result`
+ --> tests/compile-fail/state_by_value.rs:1:25
+  |
+1 | use e_agent_extension::{Result, extension};
+  |                         ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
