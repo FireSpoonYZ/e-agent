@@ -216,6 +216,7 @@ impl QueueTenant for HostcallRequest {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
 pub struct ExtensionToolDef {
+    pub extension_id: String,
     pub name: String,
     #[serde(default)]
     pub label: Option<String>,
@@ -5221,6 +5222,7 @@ fn canonical_node_builtin(spec: &str) -> Option<&'static str> {
         "readline/promises" | "node:readline/promises" => Some("node:readline/promises"),
         "url" | "node:url" => Some("node:url"),
         "net" | "node:net" => Some("node:net"),
+        "dns/promises" | "node:dns/promises" => Some("node:dns/promises"),
         "events" | "node:events" => Some("node:events"),
         "buffer" | "node:buffer" => Some("node:buffer"),
         "assert" | "node:assert" => Some("node:assert"),
@@ -8077,6 +8079,16 @@ export default Compile;
     modules.insert(
         "@mariozechner/pi-ai".to_string(),
         compressed_js_literal!(r#"
+export function isRetryableAssistantError(message) {
+  const text = String((message && (message.errorMessage || message.message)) || message || '').toLowerCase();
+  return /overload|rate.?limit|429|5\d\d|timeout|timed out|network|connection|fetch failed|retry/.test(text);
+}
+
+export function isContextOverflow(error) {
+  const message = String((error && error.message) || error || '').toLowerCase();
+  return message.includes('context') && (message.includes('overflow') || message.includes('too long') || message.includes('maximum'));
+}
+
 export function StringEnum(values, opts = {}) {
   const list = Array.isArray(values) ? values.map((v) => String(v)) : [];
   return { type: "string", enum: list, ...opts };
@@ -8710,6 +8722,7 @@ export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, create
     modules.insert(
         "@mariozechner/pi-tui".to_string(),
         compressed_js_literal!(r#"
+export function stripTerminalSequences(value) { return String(value ?? '').replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, ''); }
 export function matchesKey(_data, _key) {
   return false;
 }
@@ -9040,6 +9053,7 @@ export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Te
         "@mariozechner/pi-coding-agent".to_string(),
         compressed_js_literal!(r#"
 export const VERSION = "0.0.0";
+export function defineTool(spec) { return spec; }
 
 export const DEFAULT_MAX_LINES = 2000;
 export const DEFAULT_MAX_BYTES = 1_000_000;
@@ -12621,6 +12635,12 @@ export function writeSync(fd, buffer, offset, length, position) {
   }
   return chunk.byteLength;
 }
+export function fchmodSync(fd, _mode) {
+  __pi_vfs.getFdEntry(fd);
+}
+export function fsyncSync(fd) {
+  __pi_vfs.getFdEntry(fd);
+}
 export function fstatSync(fd) {
   const entry = __pi_vfs.getFdEntry(fd);
   __pi_vfs.authorizeFdRead(entry);
@@ -13515,6 +13535,21 @@ export default { URL: _URL, URLSearchParams: _URLSearchParams, fileURLToPath, pa
 ")
         .trim()
         .to_string(),
+    );
+
+    modules.insert(
+        "node:dns/promises".to_string(),
+        r#"
+export async function lookup(hostname, options = {}) {
+  const response = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(String(hostname))}&type=A`);
+  if (!response.ok) throw new Error(`DNS lookup failed: ${response.status}`);
+  const body = await response.json();
+  const addresses = (body.Answer || []).filter((entry) => entry.type === 1).map((entry) => ({ address: entry.data, family: 4 }));
+  if (!addresses.length) throw new Error(`DNS lookup failed for ${hostname}`);
+  return options && options.all ? addresses : addresses[0];
+}
+export default { lookup };
+"#.trim().to_string(),
     );
 
     modules.insert(
@@ -17205,9 +17240,6 @@ globalThis.console = {
                     )));
                 }
                 let function_name = serde_json::to_string(&function.name)?;
-                let arguments = (0..function.parameters.len())
-                    .map(|index| format!("arg{index}"))
-                    .collect::<Vec<_>>();
                 let expected_arguments =
                     if function.required_parameters == function.parameters.len() {
                         function.parameters.len().to_string()
@@ -17218,27 +17250,24 @@ globalThis.console = {
                             function.parameters.len()
                         )
                     };
-                let arity_check = format!(
-                    "if (arguments.length < {} || arguments.length > {}) throw new TypeError(\"{}.{} expects {expected_arguments} arguments, received \" + arguments.length);",
-                    function.required_parameters,
-                    function.parameters.len(),
-                    module.name,
-                    function.name,
-                );
-                let input = function
+                let object_input = function
                     .parameters
                     .iter()
-                    .zip(&arguments)
-                    .map(|(parameter, argument)| {
-                        Ok(format!("{}: {argument}", serde_json::to_string(parameter)?))
+                    .enumerate()
+                    .map(|(index, parameter)| {
+                        let key = serde_json::to_string(parameter)?;
+                        Ok(format!("{key}: __args[{index}]"))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 writeln!(
                     source,
-                    "export async function {}({}) {{ {arity_check} const response = JSON.parse(await globalThis.__e_agent_native_call({module_name}, {function_name}, JSON.stringify({{{}}}))); if (response.error !== undefined) throw new Error(response.error); return response.result; }}",
+                    "export async function {}(...__args) {{ const __object = __args.length === 1 && __args[0] !== null && typeof __args[0] === 'object' && !Array.isArray(__args[0]); if (!__object && (__args.length < {} || __args.length > {})) throw new TypeError(\"{}.{} expects {expected_arguments} positional arguments or one object, received \" + __args.length); const __input = __object ? __args[0] : {{{}}}; const response = JSON.parse(await globalThis.__e_agent_native_call({module_name}, {function_name}, JSON.stringify(__input))); if (response.error !== undefined) throw new Error(response.error); return response.result; }}",
                     function.name,
-                    arguments.join(", "),
-                    input.join(", "),
+                    function.required_parameters,
+                    function.parameters.len(),
+                    module.name,
+                    function.name,
+                    object_input.join(", "),
                 )
                 .expect("writing to String cannot fail");
             }
@@ -17571,6 +17600,104 @@ globalThis.console = {
         };
 
         serde_json::from_value(value).map_err(|err| Error::Json(Box::new(err)))
+    }
+
+    /// Load a standard Pi extension and wait for its sync/async factory.
+    pub async fn load_extension_with_hostcalls<F, Fut>(
+        &self,
+        extension_id: &str,
+        entry: &std::path::Path,
+        mut dispatch: F,
+    ) -> Result<()>
+    where
+        F: FnMut(HostcallRequest) -> Fut,
+        Fut: Future<Output = Vec<HostcallOutcome>>,
+    {
+        let root = entry.parent().unwrap_or_else(|| std::path::Path::new("."));
+        self.add_extension_root_with_id(root.to_path_buf(), Some(extension_id));
+        let entry = entry.to_string_lossy().replace('\\', "/");
+        let specifier = if entry.starts_with('/') {
+            format!("file://{entry}")
+        } else {
+            format!("file:///{entry}")
+        };
+        let task_id = format!("load-{}", generate_call_id());
+        let script = format!(
+            "__pi_task_start({secret:?}, {task:?}, __pi_load_extension({secret:?}, {id:?}, {entry:?}, {{ name: {id:?} }}));",
+            secret = self.bridge_secret,
+            task = task_id,
+            id = extension_id,
+            entry = specifier,
+        );
+        self.eval(&script).await?;
+        self.wait_extension_task(&task_id, &mut dispatch)
+            .await
+            .map(|_| ())
+    }
+
+    /// Execute one registered extension tool by its owning extension id.
+    pub async fn execute_extension_tool_with_hostcalls<F, Fut>(
+        &self,
+        extension_id: &str,
+        tool_name: &str,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        ctx: serde_json::Value,
+        mut dispatch: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: FnMut(HostcallRequest) -> Fut,
+        Fut: Future<Output = Vec<HostcallOutcome>>,
+    {
+        let task_id = format!("tool-{}", generate_call_id());
+        let script = format!(
+            "__pi_task_start({secret:?}, {task:?}, __pi_execute_extension_tool({secret:?}, {id:?}, {tool:?}, {call:?}, {input}, {ctx}));",
+            secret = self.bridge_secret,
+            task = task_id,
+            id = extension_id,
+            tool = tool_name,
+            call = tool_call_id,
+            input = serde_json::to_string(&input)?,
+            ctx = serde_json::to_string(&ctx)?,
+        );
+        self.eval(&script).await?;
+        self.wait_extension_task(&task_id, &mut dispatch).await
+    }
+
+    async fn wait_extension_task<F, Fut>(
+        &self,
+        task_id: &str,
+        dispatch: &mut F,
+    ) -> Result<serde_json::Value>
+    where
+        F: FnMut(HostcallRequest) -> Fut,
+        Fut: Future<Output = Vec<HostcallOutcome>>,
+    {
+        loop {
+            while let Some(request) = self.drain_hostcall_requests().pop_front() {
+                let call_id = request.call_id.clone();
+                for outcome in dispatch(request).await {
+                    self.complete_hostcall(call_id.clone(), outcome);
+                    self.tick().await?;
+                }
+            }
+            let script = format!(
+                "globalThis.__e_agent_task_state = __pi_task_take({:?}, {:?});",
+                self.bridge_secret, task_id
+            );
+            self.eval(&script).await?;
+            let state = self.read_global_json("__e_agent_task_state").await?;
+            match state.get("status").and_then(serde_json::Value::as_str) {
+                Some("resolved") => return Ok(state.get("value").cloned().unwrap_or_default()),
+                Some("rejected") => {
+                    let message = state["error"]["message"]
+                        .as_str()
+                        .unwrap_or("extension task failed");
+                    return Err(Error::extension(message.to_string()));
+                }
+                _ => tokio::task::yield_now().await,
+            }
+        }
     }
 
     /// Read a global value by name and convert it to JSON.
@@ -20379,27 +20506,23 @@ function __pi_register_tool(spec) {
         toolSpec.label = spec.label;
     }
 
-    if (__pi_tool_index.has(name)) {
-        const existing = __pi_tool_index.get(name);
-        if (existing && existing.extensionId !== ext.id) {
-            throw new Error(`registerTool: tool name collision: ${name}`);
-        }
-    }
-
     const record = { extensionId: ext.id, spec: toolSpec, execute: spec.execute };
+    if (ext.tools.has(name)) {
+        throw new Error(`registerTool: duplicate tool in extension ${ext.id}: ${name}`);
+    }
     ext.tools.set(name, record);
-    __pi_tool_index.set(name, record);
+    if (!__pi_tool_index.has(name)) __pi_tool_index.set(name, record);
 }
 
 function __pi_get_registered_tools() {
-    const names = Array.from(__pi_tool_index.keys()).map((v) => String(v));
-    names.sort();
     const out = [];
-    for (const name of names) {
-        const record = __pi_tool_index.get(name);
-        if (!record || !record.spec) continue;
-        out.push(record.spec);
+    for (const extension of __pi_extensions.values()) {
+        for (const record of extension.tools.values()) {
+            if (!record || !record.spec) continue;
+            out.push({ extension_id: record.extensionId, ...record.spec });
+        }
     }
+    out.sort((a, b) => a.extension_id.localeCompare(b.extension_id) || a.name.localeCompare(b.name));
     return out;
 }
 
@@ -21459,6 +21582,7 @@ function __pi_make_extension_ctx(ctx_payload) {
         {};
 
     const sessionManager = {
+        getSessionId: () => String((ctx_payload && (ctx_payload.sessionId || ctx_payload.session_id)) || ''),
         getEntries: () => entries,
         getBranch: () => branch,
         getLeafEntry: () => leafEntry,
@@ -21782,6 +21906,22 @@ function __pi_validate_tool_input(schema, input) {
     if (missing.length > 0) {
         throw new Error(`Tool input missing required fields: ${missing.join(', ')}`);
     }
+}
+
+async function __pi_execute_extension_tool(extension_id, tool_name, tool_call_id, input, ctx_payload) {
+    const extensionId = String(extension_id || '').trim();
+    const name = String(tool_name || '').trim();
+    const extension = __pi_extensions.get(extensionId);
+    const record = extension && extension.tools.get(name);
+    if (!record) {
+        throw new Error(`Unknown extension tool: ${extensionId}.${name}`);
+    }
+
+    __pi_validate_tool_input(record.spec && record.spec.parameters, input);
+    const ctx = __pi_make_extension_ctx(ctx_payload);
+    return __pi_with_extension_async(record.extensionId, () =>
+        record.execute(tool_call_id, input, undefined, undefined, ctx)
+    );
 }
 
 async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
@@ -24516,6 +24656,7 @@ for (const [name, fn] of Object.entries({
     __pi_set_flag_value,
     __pi_register_mcp_server_for_extension,
     __pi_load_extension,
+    __pi_execute_extension_tool,
     __pi_execute_tool,
     __pi_execute_command,
     __pi_execute_shortcut,
@@ -26950,6 +27091,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(
                 tools[0],
                 ExtensionToolDef {
+                    extension_id: "ext.test".to_string(),
                     name: "my_tool".to_string(),
                     label: Some("My Tool".to_string()),
                     description: "Does stuff".to_string(),

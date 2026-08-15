@@ -13,10 +13,10 @@ mod tools;
 
 pub use error::{Error, Result};
 pub use runtime::{
-    HostcallKind, HostcallRequest, NativeCall, NativeCallFuture, NativeFunction, NativeModule,
-    PiJsRuntime, PiJsRuntimeConfig, ProgramOutput,
+    ExtensionToolDef, HostcallKind, HostcallRequest, NativeCall, NativeCallFuture, NativeFunction,
+    NativeModule, PiJsRuntime, PiJsRuntimeConfig, ProgramOutput,
 };
-pub use scheduler::HostcallOutcome;
+pub use scheduler::{HostcallOutcome, WallClock};
 
 /// Run one JavaScript/TypeScript module with native extension modules.
 pub async fn execute_program(

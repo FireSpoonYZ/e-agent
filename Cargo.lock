@@ -770,6 +770,7 @@ dependencies = [
  "async-channel",
  "async-openai",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "dotenvy",

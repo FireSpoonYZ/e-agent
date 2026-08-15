@@ -27,12 +27,25 @@ async fn main() -> Result<()> {
     let provider = OpenAIProvider::new().context("create openai provider failed")?;
     let mut tool_executor = ProgrammaticToolExecutor::default();
     let tool_paths = std::env::var_os("E_AGENT_TOOL_PATHS")
-        .ok_or_else(|| anyhow!("E_AGENT_TOOL_PATHS is not set"))?;
-    let tool_paths: Vec<_> = std::env::split_paths(&tool_paths).collect();
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default();
     for path in tool_paths {
         tool_executor
             .load(&path)
             .with_context(|| format!("load {} failed", path.display()))?;
+    }
+    if let Some(paths) = std::env::var_os("E_AGENT_EXTENSION_PATHS") {
+        for path in std::env::split_paths(&paths) {
+            tool_executor
+                .load_pi_extension(&path)
+                .await
+                .with_context(|| format!("load Pi extension {} failed", path.display()))?;
+        }
+    }
+    if tool_executor.tools().is_empty() && std::env::var_os("E_AGENT_EXTENSION_PATHS").is_none() {
+        return Err(anyhow!(
+            "E_AGENT_TOOL_PATHS or E_AGENT_EXTENSION_PATHS must be set"
+        ));
     }
 
     let mut session = Session::new(provider, tool_executor, SYSTEM_PROMPT);
