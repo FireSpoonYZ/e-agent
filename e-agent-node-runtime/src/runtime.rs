@@ -9054,6 +9054,10 @@ export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Te
         compressed_js_literal!(r#"
 export const VERSION = "0.0.0";
 export function defineTool(spec) { return spec; }
+export async function resizeImage(data, mimeType, options = {}) {
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data ?? []);
+  return { data: bytes, mimeType: String(mimeType || "application/octet-stream"), width: options.maxWidth, height: options.maxHeight };
+}
 
 export const DEFAULT_MAX_LINES = 2000;
 export const DEFAULT_MAX_BYTES = 1_000_000;
@@ -17581,6 +17585,68 @@ globalThis.console = {
         self.hostcall_tracker.borrow().is_active(call_id)
     }
 
+    /// Snapshot commands registered by loaded extensions.
+    pub async fn get_registered_commands(&self) -> Result<Vec<serde_json::Value>> {
+        self.interrupt_budget.reset();
+        let script = format!(
+            "globalThis.__e_agent_commands = __pi_snapshot_extensions({:?}).flatMap(e => e.slash_commands.map(c => ({{...c, extension_id: e.id}})));",
+            self.bridge_secret
+        );
+        self.eval(&script).await?;
+        serde_json::from_value(self.read_global_json("__e_agent_commands").await?)
+            .map_err(|err| Error::Json(Box::new(err)))
+    }
+
+    /// Execute one extension command while servicing its hostcalls.
+    pub async fn execute_extension_command_with_hostcalls<F, Fut>(
+        &self,
+        command: &str,
+        args: &str,
+        ctx: serde_json::Value,
+        mut dispatch: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: FnMut(HostcallRequest) -> Fut,
+        Fut: Future<Output = Vec<HostcallOutcome>>,
+    {
+        let task_id = format!("command-{}", generate_call_id());
+        let script = format!(
+            "__pi_task_start({secret:?}, {task:?}, __pi_execute_command({secret:?}, {command:?}, {args:?}, {ctx}));",
+            secret = self.bridge_secret,
+            task = task_id,
+            command = command,
+            args = args,
+            ctx = serde_json::to_string(&ctx)?,
+        );
+        self.eval(&script).await?;
+        self.wait_extension_task(&task_id, &mut dispatch).await
+    }
+
+    /// Dispatch one lifecycle event while servicing its hostcalls.
+    pub async fn dispatch_extension_event_with_hostcalls<F, Fut>(
+        &self,
+        event: &str,
+        payload: serde_json::Value,
+        ctx: serde_json::Value,
+        mut dispatch: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: FnMut(HostcallRequest) -> Fut,
+        Fut: Future<Output = Vec<HostcallOutcome>>,
+    {
+        let task_id = format!("event-{}", generate_call_id());
+        let script = format!(
+            "__pi_task_start({secret:?}, {task:?}, __pi_dispatch_extension_event({secret:?}, {event:?}, {payload}, {ctx}));",
+            secret = self.bridge_secret,
+            task = task_id,
+            event = event,
+            payload = serde_json::to_string(&payload)?,
+            ctx = serde_json::to_string(&ctx)?,
+        );
+        self.eval(&script).await?;
+        self.wait_extension_task(&task_id, &mut dispatch).await
+    }
+
     /// Get all tools registered by loaded JS extensions.
     pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
         self.interrupt_budget.reset();
@@ -17674,7 +17740,8 @@ globalThis.console = {
         Fut: Future<Output = Vec<HostcallOutcome>>,
     {
         loop {
-            while let Some(request) = self.drain_hostcall_requests().pop_front() {
+            let mut requests = self.drain_hostcall_requests();
+            while let Some(request) = requests.pop_front() {
                 let call_id = request.call_id.clone();
                 for outcome in dispatch(request).await {
                     self.complete_hostcall(call_id.clone(), outcome);
@@ -17688,7 +17755,18 @@ globalThis.console = {
             self.eval(&script).await?;
             let state = self.read_global_json("__e_agent_task_state").await?;
             match state.get("status").and_then(serde_json::Value::as_str) {
-                Some("resolved") => return Ok(state.get("value").cloned().unwrap_or_default()),
+                Some("resolved") => {
+                    self.tick().await?;
+                    let mut requests = self.drain_hostcall_requests();
+                    while let Some(request) = requests.pop_front() {
+                        let call_id = request.call_id.clone();
+                        for outcome in dispatch(request).await {
+                            self.complete_hostcall(call_id.clone(), outcome);
+                            self.tick().await?;
+                        }
+                    }
+                    return Ok(state.get("value").cloned().unwrap_or_default());
+                }
                 Some("rejected") => {
                     let message = state["error"]["message"]
                         .as_str()
@@ -21044,7 +21122,7 @@ function __pi_set_active_tools(tools) {
 
 function __pi_get_active_tools() {
     const ext = __pi_current_extension_or_throw();
-    if (!Array.isArray(ext.activeTools)) return undefined;
+    if (!Array.isArray(ext.activeTools)) return Array.from(__pi_tool_index.keys());
     return ext.activeTools.slice();
 }
 
@@ -21091,13 +21169,11 @@ function __pi_append_entry(custom_type, data) {
     if (!customType) {
         throw new Error('appendEntry: customType is required');
     }
-    try {
-        pi.events('appendEntry', {
-            extensionId: ext.id,
-            customType: customType,
-            data: data === undefined ? null : data,
-        }).catch(() => {});
-    } catch (_) {}
+    __pi_events_native('appendEntry', {
+        extensionId: ext.id,
+        customType: customType,
+        data: data === undefined ? null : data,
+    });
 }
 
 function __pi_send_message(message, options) {
@@ -21106,9 +21182,7 @@ function __pi_send_message(message, options) {
         throw new Error('sendMessage: message must be an object');
     }
     const opts = options && typeof options === 'object' ? options : {};
-    try {
-        pi.events('sendMessage', { extensionId: ext.id, message: message, options: opts }).catch(() => {});
-    } catch (_) {}
+    __pi_events_native('sendMessage', { extensionId: ext.id, message: message, options: opts });
 }
 
 function __pi_send_user_message(text, options) {
@@ -21116,9 +21190,7 @@ function __pi_send_user_message(text, options) {
     const msg = String(text === undefined || text === null ? '' : text).trim();
     if (!msg) return;
     const opts = options && typeof options === 'object' ? options : {};
-    try {
-        pi.events('sendUserMessage', { extensionId: ext.id, text: msg, options: opts }).catch(() => {});
-    } catch (_) {}
+    __pi_events_native('sendUserMessage', { extensionId: ext.id, text: msg, options: opts });
 }
 
 function __pi_snapshot_extensions() {
@@ -21590,7 +21662,10 @@ function __pi_make_extension_ctx(ctx_payload) {
 
     return {
         hasUI: hasUI,
+        mode: String((ctx_payload && ctx_payload.mode) || 'print'),
         cwd: cwd,
+        isIdle: () => !!(ctx_payload && (ctx_payload.isIdle ?? ctx_payload.is_idle)),
+        hasPendingMessages: () => !!(ctx_payload && (ctx_payload.hasPendingMessages ?? ctx_payload.has_pending_messages)),
         ui: __pi_make_extension_ui(hasUI),
         sessionManager: sessionManager,
         modelRegistry: {

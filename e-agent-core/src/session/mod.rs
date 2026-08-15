@@ -1,43 +1,210 @@
-use anyhow::{Context, Result};
+pub mod queue;
+pub mod store;
+
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
 use e_agent_extension::SessionId;
 
 use crate::{
+    lifecycle::{LifecycleEffect, LifecycleEvent},
     message::{Message, MessageContent, ToolResultMessage, UserMessage},
     provider::Provider,
-    tool::ToolExecutor,
+    session::{
+        queue::{MessageQueue, MessageSink, QueuedMessage},
+        store::{JsonlSessionStore, SessionStore},
+    },
+    tool::{
+        ToolExecutor,
+        extension::{ExtensionHost, HostAction},
+    },
 };
 
-pub struct Session<P: Provider, E: ToolExecutor> {
-    id: SessionId,
-    system_prompt: String,
-    messages: Vec<Message>,
-    trun: usize,
-    provider: P,
-    tool_executor: E,
+#[derive(Debug, Clone)]
+pub struct SessionContext {
+    pub session_id: SessionId,
+    pub cwd: PathBuf,
+    pub entries: Vec<serde_json::Value>,
+    pub idle: bool,
 }
 
-impl<P: Provider, E: ToolExecutor> Session<P, E> {
-    pub fn new(provider: P, tool_executor: E, system_prompt: impl ToString) -> Self {
-        Self {
-            id: SessionId::next(),
+pub struct Session<P: Provider, E: ToolExecutor + ExtensionHost> {
+    cwd: PathBuf,
+    on_message: Option<Box<dyn Fn(&Message)>>,
+    model: String,
+    system_prompt: String,
+    store: JsonlSessionStore,
+    queue: MessageQueue,
+    run: usize,
+    provider: P,
+    tool_executor: E,
+    started: bool,
+    closed: bool,
+}
+
+impl<P: Provider, E: ToolExecutor + ExtensionHost> Session<P, E> {
+    pub fn new(
+        provider: P,
+        tool_executor: E,
+        cwd: impl Into<PathBuf>,
+        model: impl Into<String>,
+        system_prompt: impl ToString,
+    ) -> Self {
+        Self::open(provider, tool_executor, cwd, model, system_prompt, None)
+            .expect("create session store")
+    }
+
+    pub fn open(
+        provider: P,
+        tool_executor: E,
+        cwd: impl Into<PathBuf>,
+        model: impl Into<String>,
+        system_prompt: impl ToString,
+        path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let mut queue = MessageQueue::default();
+        queue.set_idle(true);
+        Ok(Self {
             provider,
             tool_executor,
+            cwd: cwd.into(),
+            on_message: None,
+            model: model.into(),
             system_prompt: system_prompt.to_string(),
-            messages: Vec::new(),
-            trun: 0,
+            store: JsonlSessionStore::open(path)?,
+            queue,
+            run: 0,
+            started: false,
+            closed: false,
+        })
+    }
+
+    pub fn set_message_handler(&mut self, handler: impl Fn(&Message) + 'static) {
+        self.on_message = Some(Box::new(handler));
+    }
+
+    fn emit_message(&self, message: &Message) {
+        if let Some(handler) = &self.on_message {
+            handler(message);
         }
     }
 
     pub fn id(&self) -> SessionId {
-        self.id
+        self.store.id()
+    }
+    pub fn path(&self) -> &Path {
+        self.store.path()
     }
 
-    /// Release the per-session state held by every loaded extension.
+    fn context(&self) -> SessionContext {
+        SessionContext {
+            session_id: self.id(),
+            cwd: self.cwd.clone(),
+            entries: self
+                .store
+                .entries()
+                .iter()
+                .map(|entry| serde_json::to_value(entry).unwrap())
+                .collect(),
+            idle: self.queue.is_idle(),
+        }
+    }
+
+    async fn dispatch(&mut self, event: LifecycleEvent) -> Result<LifecycleEffect> {
+        let effect = self.tool_executor.dispatch(event, &self.context()).await?;
+        self.apply_actions()?;
+        Ok(effect)
+    }
+
+    fn apply_actions(&mut self) -> Result<()> {
+        for action in self.tool_executor.take_host_actions() {
+            match action {
+                HostAction::AppendEntry { kind, data } => self.store.append_custom(kind, data)?,
+                HostAction::SendUserMessage { text, deliver_as } => {
+                    let queued = if deliver_as == "steer" {
+                        QueuedMessage::Steer(text)
+                    } else {
+                        QueuedMessage::FollowUp(text)
+                    };
+                    self.queue.enqueue(queued)?;
+                }
+                HostAction::SendMessage {
+                    message,
+                    deliver_as,
+                    trigger_turn,
+                } => {
+                    let kind = message["customType"]
+                        .as_str()
+                        .unwrap_or("extension-message")
+                        .to_string();
+                    self.store.append_custom(kind, message.clone())?;
+                    if trigger_turn {
+                        let text = message["content"].as_str().unwrap_or_default().to_string();
+                        let queued = if deliver_as == "steer" {
+                            QueuedMessage::Steer(text)
+                        } else {
+                            QueuedMessage::FollowUp(text)
+                        };
+                        self.queue.enqueue(queued)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_started(&mut self) -> Result<()> {
+        if !self.started {
+            self.started = true;
+            self.dispatch(LifecycleEvent::SessionStart).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn resume_pending(&mut self) -> Result<()> {
+        let resumed_goal = self
+            .store
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                store::SessionEntry::Custom { custom_type, data }
+                    if custom_type == "goal-state" && data["goal"]["status"] == "active" =>
+                {
+                    Some((
+                        data["goal"]["id"].as_str()?.to_string(),
+                        data["goal"]["text"].as_str()?.to_string(),
+                    ))
+                }
+                _ => None,
+            });
+        self.ensure_started().await?;
+        self.queue.set_idle(true);
+        self.dispatch(LifecycleEvent::AgentSettled).await?;
+        if let Some((goal_id, objective)) = resumed_goal {
+            self.queue.enqueue(QueuedMessage::FollowUp(format!(
+                "Resume the active goal after process restart. Objective: {objective}\nUse the current goal_id {goal_id} when completing it."
+            )))?;
+        }
+        while let Some(follow_up) = self.queue.pop_follow_up() {
+            self.run_agent(UserMessage::text(follow_up)).await?;
+        }
+        Ok(())
+    }
+
     pub async fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.ensure_started().await?;
+        self.dispatch(LifecycleEvent::SessionShutdown).await?;
+        self.store.save()?;
         self.tool_executor
-            .drop_session(self.id)
+            .drop_session(self.id())
             .await
-            .map_err(|err| anyhow::anyhow!("drop session state failed: {err:?}"))
+            .map_err(|err| anyhow::anyhow!("drop session state failed: {err:?}"))?;
+        self.closed = true;
+        Ok(())
     }
 
     pub fn build_system_prompt(&self) -> String {
@@ -45,7 +212,7 @@ impl<P: Provider, E: ToolExecutor> Session<P, E> {
             "{}\n当前时间为:{}\n当前目录为:{}",
             self.system_prompt,
             chrono::Local::now(),
-            std::env::current_dir().unwrap().display()
+            self.cwd.display()
         );
         for extension_prompt in self.tool_executor.system_prompts() {
             prompt.push('\n');
@@ -55,173 +222,216 @@ impl<P: Provider, E: ToolExecutor> Session<P, E> {
     }
 
     pub async fn run_one_trun(&mut self, user_input: UserMessage) -> Result<()> {
-        self.trun += 1;
-        self.messages.push(Message::User(user_input));
+        self.ensure_started().await?;
+        let mut text = user_input
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                MessageContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some((name, args)) = parse_command(&text)
+            && self
+                .tool_executor
+                .commands()
+                .iter()
+                .any(|command| command.name == name)
+        {
+            self.tool_executor
+                .command(name, args, &self.context())
+                .await?;
+            self.apply_actions()?;
+        } else {
+            match self
+                .dispatch(LifecycleEvent::Input {
+                    text: text.clone(),
+                    source: "interactive".into(),
+                })
+                .await?
+            {
+                LifecycleEffect::TransformInput { text: transformed } => text = transformed,
+                LifecycleEffect::Handled => return Ok(()),
+                _ => {}
+            }
+            self.run_agent(UserMessage::text(text)).await?;
+        }
+        while let Some(follow_up) = self.queue.pop_follow_up() {
+            self.run_agent(UserMessage::text(follow_up)).await?;
+        }
+        Ok(())
+    }
 
-        println!("\n\n================ trun {} ================", self.trun);
+    async fn run_agent(&mut self, user_input: UserMessage) -> Result<()> {
+        self.run += 1;
+        self.queue.set_idle(false);
+        let user = Message::User(user_input);
+        self.store.append_message(user.clone())?;
+        self.dispatch(LifecycleEvent::MessageStart {
+            message: user.clone(),
+        })
+        .await?;
+        self.dispatch(LifecycleEvent::MessageEnd {
+            message: user.clone(),
+        })
+        .await?;
 
+        let prompt = user
+            .content()
+            .iter()
+            .filter_map(|part| match part {
+                MessageContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut system_prompt = self.build_system_prompt();
+        if let LifecycleEffect::BeforeAgentStart {
+            system_prompt: changed,
+            messages,
+        } = self
+            .dispatch(LifecycleEvent::BeforeAgentStart {
+                prompt,
+                system_prompt: system_prompt.clone(),
+            })
+            .await?
+        {
+            if !changed.is_empty() {
+                system_prompt = changed;
+            }
+            for message in messages {
+                self.store.append_message(message)?;
+            }
+        }
+        self.dispatch(LifecycleEvent::AgentStart).await?;
+        let start = self.store.messages().len();
+        let result = self.agent_loop(system_prompt).await;
+        let error = result.as_ref().err().map(|error| format!("{error:#}"));
+        self.dispatch(LifecycleEvent::AgentEnd {
+            messages: self.store.messages()[start..].to_vec(),
+            error,
+        })
+        .await?;
+        self.queue.set_idle(true);
+        self.dispatch(LifecycleEvent::AgentSettled).await?;
+        result
+    }
+
+    async fn agent_loop(&mut self, system_prompt: String) -> Result<()> {
+        let mut turn_index = 0;
         loop {
-            let system_prompt = self.build_system_prompt();
+            self.dispatch(LifecycleEvent::TurnStart { turn_index })
+                .await?;
             let tool_defs = self.tool_executor.tool_defs();
             let context = crate::message::Context {
                 system_prompt: Some(&system_prompt),
-                messages: &self.messages,
+                messages: self.store.messages(),
                 tools: &tool_defs,
             };
-            let model = std::env::var("E_MODULE_BIG").context("get model failed")?;
-            let answer = match self.provider.send(&model, context).await {
-                Ok(answer) => answer,
-                Err(e) => {
-                    println!("llm invoke failed: {e:?}");
-                    break;
-                }
-            };
+            let answer = self
+                .provider
+                .send(&self.model, context)
+                .await
+                .map_err(|error| anyhow::anyhow!("llm invoke failed: {error:?}"))?;
+            let assistant = Message::Assistant(answer.clone());
+            self.emit_message(&assistant);
+            self.dispatch(LifecycleEvent::MessageStart {
+                message: assistant.clone(),
+            })
+            .await?;
+            self.store.append_message(assistant.clone())?;
+            self.dispatch(LifecycleEvent::MessageEnd {
+                message: assistant.clone(),
+            })
+            .await?;
 
-            print_message(&answer.content);
-
-            println!("================================");
-
-            self.messages.push(Message::Assistant(answer.clone()));
-
-            // toolcall
-            let mut will_stop_loop = true;
-            for content in answer.content.into_iter() {
-                if let MessageContent::ToolUse {
+            let mut tool_results = Vec::new();
+            for content in answer.content {
+                let MessageContent::ToolUse {
                     id,
                     name,
                     input,
                     custom,
                     ..
                 } = content
+                else {
+                    continue;
+                };
+                let blocked = match self
+                    .dispatch(LifecycleEvent::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    })
+                    .await?
                 {
-                    will_stop_loop = false;
-                    let tool_result = match self.tool_executor.call(self.id, &name, input).await {
-                        Ok(output) => ToolResultMessage {
-                            tool_use_id: id,
+                    LifecycleEffect::BlockTool { reason } => Some(reason),
+                    _ => None,
+                };
+                let result = if let Some(reason) = blocked {
+                    Err(anyhow::anyhow!(reason))
+                } else {
+                    self.tool_executor
+                        .call(self.id(), &name, input)
+                        .await
+                        .map_err(|error| anyhow::anyhow!("{error:?}"))
+                };
+                let (tool_result, value, is_error) = match result {
+                    Ok(output) => (
+                        ToolResultMessage {
+                            tool_use_id: id.clone(),
                             content: output.content,
                             is_error: false,
                             custom,
                         },
-                        Err(e) => {
-                            let mut result = ToolResultMessage::error(id, format!("{e:?}"));
-                            result.custom = custom;
-                            result
-                        }
-                    };
-
-                    print_message(&tool_result.content);
-
-                    self.messages.push(Message::ToolResult(tool_result));
+                        output.details.unwrap_or_default(),
+                        false,
+                    ),
+                    Err(error) => {
+                        let mut result = ToolResultMessage::error(id.clone(), format!("{error:#}"));
+                        result.custom = custom;
+                        (
+                            result,
+                            serde_json::json!({"error":format!("{error:#}")}),
+                            true,
+                        )
+                    }
+                };
+                self.dispatch(LifecycleEvent::ToolExecutionEnd {
+                    id,
+                    name,
+                    result: value,
+                    is_error,
+                })
+                .await?;
+                let message = Message::ToolResult(tool_result);
+                self.emit_message(&message);
+                self.store.append_message(message.clone())?;
+                tool_results.push(message);
+                if let Some(steer) = self.queue.pop_steer() {
+                    self.store
+                        .append_message(Message::User(UserMessage::text(steer)))?;
                 }
             }
-
-            if will_stop_loop {
-                println!("tool call is empty, finish this trun");
+            self.dispatch(LifecycleEvent::TurnEnd {
+                turn_index,
+                message: Some(assistant),
+                tool_results: tool_results.clone(),
+            })
+            .await?;
+            if tool_results.is_empty() {
                 break;
             }
-
-            println!("================================\n\n\n");
+            turn_index += 1;
         }
         Ok(())
     }
 }
 
-fn print_message(content: &[MessageContent]) {
-    for content in content.iter() {
-        match content {
-            crate::message::MessageContent::Text { text } => {
-                println!("text: {text}");
-            }
-            crate::message::MessageContent::Thinking { thinking, .. } => {
-                println!("thinking: {thinking}");
-            }
-            crate::message::MessageContent::ToolUse { name, input, .. } => {
-                println!("tool use: {}\n{}", name, input);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use e_agent_extension::SessionId;
-
-    use super::Session;
-    use crate::{
-        message::{AssistantMessage, Context, ToolDef},
-        provider::Provider,
-        tool::{ToolExecutor, ToolOutput},
-    };
-
-    struct NoProvider;
-
-    #[async_trait::async_trait]
-    impl Provider for NoProvider {
-        type Error = anyhow::Error;
-        async fn send(
-            &self,
-            _model: &str,
-            _context: Context<'_>,
-        ) -> Result<AssistantMessage, Self::Error> {
-            unimplemented!("prompt assembly does not call the provider")
-        }
-    }
-
-    /// Two extensions whose prompts must stay in load order.
-    struct TwoExtensions;
-
-    #[async_trait::async_trait(?Send)]
-    impl ToolExecutor for TwoExtensions {
-        type Error = anyhow::Error;
-        fn tool_defs(&self) -> Vec<ToolDef> {
-            Vec::new()
-        }
-        fn system_prompts(&self) -> Vec<String> {
-            vec![
-                "first extension prompt".into(),
-                "second extension prompt".into(),
-            ]
-        }
-        async fn call(
-            &self,
-            _session: SessionId,
-            _name: &str,
-            _input: String,
-        ) -> Result<ToolOutput, Self::Error> {
-            unimplemented!("prompt assembly does not call tools")
-        }
-        async fn drop_session(&self, _session: SessionId) -> Result<(), Self::Error> {
-            Ok(())
-        }
-    }
-
-    /// Base prompt, runtime context, then extension prompts in load order.
-    #[test]
-    fn assembles_prompt_in_deterministic_order() {
-        let session = Session::new(NoProvider, TwoExtensions, "base prompt");
-        let prompt = session.build_system_prompt();
-        let lines: Vec<_> = prompt.lines().collect();
-
-        assert_eq!(lines[0], "base prompt");
-        assert!(lines[1].starts_with("当前时间为:"));
-        assert!(lines[2].starts_with("当前目录为:"));
-        assert_eq!(
-            &lines[3..],
-            ["first extension prompt", "second extension prompt"]
-        );
-    }
-
-    /// Every session gets its own identity, and closing one is not an error.
-    #[test]
-    fn assigns_unique_session_ids() {
-        let mut first = Session::new(NoProvider, TwoExtensions, "base");
-        let second = Session::new(NoProvider, TwoExtensions, "base");
-        assert_ne!(first.id(), second.id());
-
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(first.close())
-            .unwrap();
-    }
+fn parse_command(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    let command = input.strip_prefix('/')?;
+    let split = command.find(char::is_whitespace).unwrap_or(command.len());
+    Some((&command[..split], command[split..].trim_start()))
 }

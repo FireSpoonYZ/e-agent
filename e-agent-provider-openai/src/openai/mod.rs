@@ -17,11 +17,11 @@ use async_openai::{
 };
 use url::Url;
 
-use super::Provider;
-use crate::message::{
-    AssistantMessage, Message, MessageContent, StopReason, ToolDef, ToolInput, Usage,
-};
 use anyhow::{Context, Result, bail};
+use e_agent_core::{
+    Provider,
+    message::{AssistantMessage, Message, MessageContent, StopReason, ToolDef, ToolInput, Usage},
+};
 
 pub struct OpenAIProvider {
     client: Client<OpenAIConfig>,
@@ -52,7 +52,7 @@ impl Provider for OpenAIProvider {
     async fn send(
         &self,
         model: &str,
-        context: crate::message::Context<'_>,
+        context: e_agent_core::message::Context<'_>,
     ) -> Result<AssistantMessage> {
         let mut request = CreateResponseArgs::default();
         let (model, effort) = model.split_once(":").unwrap_or((model, "none"));
@@ -317,7 +317,7 @@ fn from_response(response: Response) -> Result<AssistantMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::ToolResultMessage;
+    use e_agent_core::message::ToolResultMessage;
 
     fn response(status: Status, output: Vec<OutputItem>) -> Response {
         Response {
@@ -372,7 +372,7 @@ mod tests {
     #[test]
     fn flattens_text_tool_calls_and_results_in_order() {
         let messages = vec![
-            Message::User(crate::message::UserMessage::text("hi")),
+            Message::User(e_agent_core::message::UserMessage::text("hi")),
             Message::Assistant(AssistantMessage {
                 content: vec![
                     MessageContent::Thinking {

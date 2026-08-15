@@ -22,6 +22,11 @@ use serde::{Deserialize, Serialize};
 pub struct SessionId(pub u64);
 
 impl SessionId {
+    /// Allocate a stable host session id, optionally restoring one persisted in the file name.
+    pub fn from_persisted(value: u64) -> Self {
+        Self(value)
+    }
+
     /// Allocate the next process-local session id.
     pub fn next() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);

@@ -1,4 +1,4 @@
-pub mod ptc;
+pub mod extension;
 
 use e_agent_extension::SessionId;
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,6 @@ use crate::message::{MessageContent, ToolDef};
 pub trait ToolExecutor: Send + Sync {
     type Error: std::fmt::Debug;
     fn tool_defs(&self) -> Vec<ToolDef>;
-    /// Extra system-prompt text contributed by loaded extensions, in load order.
     fn system_prompts(&self) -> Vec<String> {
         Vec::new()
     }
@@ -19,7 +18,6 @@ pub trait ToolExecutor: Send + Sync {
         name: &str,
         input: String,
     ) -> Result<ToolOutput, Self::Error>;
-    /// Release any per-session state held for `session`.
     async fn drop_session(&self, session: SessionId) -> Result<(), Self::Error>;
 }
 

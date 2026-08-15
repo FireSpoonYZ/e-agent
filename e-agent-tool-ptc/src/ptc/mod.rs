@@ -17,9 +17,14 @@ use e_agent_node_runtime::{
 use libloading::Library;
 use serde::Serialize;
 
-use crate::{
+use e_agent_core::{
+    lifecycle::{LifecycleEffect, LifecycleEvent, LifecycleHook},
     message::{MessageContent, ToolDef, ToolInput},
-    tool::{ToolExecutor, ToolOutput},
+    session::SessionContext,
+    tool::{
+        ToolExecutor, ToolOutput,
+        extension::{CommandDef, ExtensionHost, HostAction},
+    },
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +63,33 @@ struct JsExtension {
     tools: Vec<ExtensionToolDef>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct JsCommandDef {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+struct HostcallState {
+    actions: std::sync::Mutex<Vec<HostAction>>,
+}
+
+impl HostcallState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            actions: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+    fn take(&self) -> Vec<HostAction> {
+        std::mem::take(
+            &mut *self
+                .actions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+    }
+}
+
 enum JsRuntimeCommand {
     Load {
         extension_id: String,
@@ -70,6 +102,24 @@ enum JsRuntimeCommand {
         call_id: String,
         input: serde_json::Value,
         context: serde_json::Value,
+        hostcalls: Arc<HostcallState>,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
+    },
+    GetCommands {
+        reply: tokio::sync::oneshot::Sender<Result<Vec<JsCommandDef>>>,
+    },
+    ExecuteCommand {
+        name: String,
+        args: String,
+        context: serde_json::Value,
+        hostcalls: Arc<HostcallState>,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
+    },
+    DispatchEvent {
+        name: String,
+        payload: serde_json::Value,
+        context: serde_json::Value,
+        hostcalls: Arc<HostcallState>,
         reply: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
     },
     Shutdown,
@@ -141,6 +191,7 @@ impl JsRuntimeHandle {
                                     call_id,
                                     input,
                                     context,
+                                    hostcalls,
                                     reply,
                                 } => {
                                     let result = runtime
@@ -150,7 +201,74 @@ impl JsRuntimeHandle {
                                             &call_id,
                                             input,
                                             context,
-                                            execute_hostcall,
+                                            move |request| {
+                                                execute_hostcall_with_state(
+                                                    request,
+                                                    Arc::clone(&hostcalls),
+                                                )
+                                            },
+                                        )
+                                        .await
+                                        .map_err(anyhow::Error::new);
+                                    let _ = reply.send(result);
+                                }
+                                JsRuntimeCommand::GetCommands { reply } => {
+                                    let result = runtime
+                                        .get_registered_commands()
+                                        .await
+                                        .map_err(anyhow::Error::new)
+                                        .and_then(|value| {
+                                            value
+                                                .into_iter()
+                                                .map(|item| {
+                                                    serde_json::from_value(item)
+                                                        .map_err(anyhow::Error::new)
+                                                })
+                                                .collect()
+                                        });
+                                    let _ = reply.send(result);
+                                }
+                                JsRuntimeCommand::ExecuteCommand {
+                                    name,
+                                    args,
+                                    context,
+                                    hostcalls,
+                                    reply,
+                                } => {
+                                    let result = runtime
+                                        .execute_extension_command_with_hostcalls(
+                                            &name,
+                                            &args,
+                                            context,
+                                            move |request| {
+                                                execute_hostcall_with_state(
+                                                    request,
+                                                    Arc::clone(&hostcalls),
+                                                )
+                                            },
+                                        )
+                                        .await
+                                        .map_err(anyhow::Error::new);
+                                    let _ = reply.send(result);
+                                }
+                                JsRuntimeCommand::DispatchEvent {
+                                    name,
+                                    payload,
+                                    context,
+                                    hostcalls,
+                                    reply,
+                                } => {
+                                    let result = runtime
+                                        .dispatch_extension_event_with_hostcalls(
+                                            &name,
+                                            payload,
+                                            context,
+                                            move |request| {
+                                                execute_hostcall_with_state(
+                                                    request,
+                                                    Arc::clone(&hostcalls),
+                                                )
+                                            },
                                         )
                                         .await
                                         .map_err(anyhow::Error::new);
@@ -195,6 +313,7 @@ impl JsRuntimeHandle {
         call_id: String,
         input: serde_json::Value,
         context: serde_json::Value,
+        hostcalls: Arc<HostcallState>,
     ) -> Result<serde_json::Value> {
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.sender
@@ -204,6 +323,55 @@ impl JsRuntimeHandle {
                 call_id,
                 input,
                 context,
+                hostcalls,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("Pi extension runtime is shut down"))?;
+        receive.await.context("Pi extension runtime stopped")?
+    }
+
+    async fn get_commands(&self) -> Result<Vec<JsCommandDef>> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(JsRuntimeCommand::GetCommands { reply })
+            .map_err(|_| anyhow::anyhow!("Pi extension runtime is shut down"))?;
+        receive.await.context("Pi extension runtime stopped")?
+    }
+
+    async fn command(
+        &self,
+        name: String,
+        args: String,
+        context: serde_json::Value,
+        hostcalls: Arc<HostcallState>,
+    ) -> Result<serde_json::Value> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(JsRuntimeCommand::ExecuteCommand {
+                name,
+                args,
+                context,
+                hostcalls,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("Pi extension runtime is shut down"))?;
+        receive.await.context("Pi extension runtime stopped")?
+    }
+
+    async fn dispatch(
+        &self,
+        name: String,
+        payload: serde_json::Value,
+        context: serde_json::Value,
+        hostcalls: Arc<HostcallState>,
+    ) -> Result<serde_json::Value> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(JsRuntimeCommand::DispatchEvent {
+                name,
+                payload,
+                context,
+                hostcalls,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("Pi extension runtime is shut down"))?;
@@ -215,13 +383,28 @@ impl JsRuntimeHandle {
     }
 }
 
-#[derive(Default)]
 pub struct ProgrammaticToolExecutor {
     extensions: Vec<Arc<LoadedExtension>>,
     js_runtime: Option<JsRuntimeHandle>,
     js_extensions: Vec<JsExtension>,
+    js_commands: Vec<CommandDef>,
+    host_actions: Arc<HostcallState>,
     closed: std::sync::atomic::AtomicBool,
     call_sequence: std::sync::atomic::AtomicU64,
+}
+
+impl Default for ProgrammaticToolExecutor {
+    fn default() -> Self {
+        Self {
+            extensions: Vec::new(),
+            js_runtime: None,
+            js_extensions: Vec::new(),
+            js_commands: Vec::new(),
+            host_actions: HostcallState::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            call_sequence: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -283,6 +466,71 @@ impl ToolExecutor for ProgrammaticToolExecutor {
 }
 
 impl ProgrammaticToolExecutor {
+    fn pi_context(ctx: &SessionContext) -> serde_json::Value {
+        serde_json::json!({
+            "cwd": ctx.cwd.to_string_lossy(), "mode": "print", "hasUI": false,
+            "sessionId": ctx.session_id.to_string(), "sessionEntries": ctx.entries,
+            "sessionBranch": ctx.entries, "isIdle": ctx.idle, "hasPendingMessages": !ctx.idle,
+        })
+    }
+
+    fn pi_event(event: LifecycleEvent) -> (&'static str, serde_json::Value) {
+        match event {
+            LifecycleEvent::SessionStart => {
+                ("session_start", serde_json::json!({"reason":"startup"}))
+            }
+            LifecycleEvent::Input { text, source } => {
+                ("input", serde_json::json!({"text":text,"source":source}))
+            }
+            LifecycleEvent::BeforeAgentStart {
+                prompt,
+                system_prompt,
+            } => (
+                "before_agent_start",
+                serde_json::json!({"prompt":prompt,"systemPrompt":system_prompt}),
+            ),
+            LifecycleEvent::AgentStart => ("agent_start", serde_json::json!({})),
+            LifecycleEvent::TurnStart { turn_index } => {
+                ("turn_start", serde_json::json!({"turnIndex":turn_index}))
+            }
+            LifecycleEvent::MessageStart { message } => {
+                ("message_start", serde_json::json!({"message":message}))
+            }
+            LifecycleEvent::MessageEnd { message } => {
+                ("message_end", serde_json::json!({"message":message}))
+            }
+            LifecycleEvent::ToolCall { id, name, input } => (
+                "tool_call",
+                serde_json::json!({"toolCallId":id,"toolName":name,"input":serde_json::from_str::<serde_json::Value>(&input).unwrap_or(serde_json::Value::String(input))}),
+            ),
+            LifecycleEvent::ToolExecutionEnd {
+                id,
+                name,
+                result,
+                is_error,
+            } => (
+                "tool_execution_end",
+                serde_json::json!({"toolCallId":id,"toolName":name,"result":result,"isError":is_error}),
+            ),
+            LifecycleEvent::TurnEnd {
+                turn_index,
+                message,
+                tool_results,
+            } => (
+                "turn_end",
+                serde_json::json!({"turnIndex":turn_index,"message":message,"toolResults":tool_results}),
+            ),
+            LifecycleEvent::AgentEnd { messages, error } => (
+                "agent_end",
+                serde_json::json!({"messages":messages,"error":error}),
+            ),
+            LifecycleEvent::AgentSettled => ("agent_settled", serde_json::json!({})),
+            LifecycleEvent::SessionShutdown => {
+                ("session_shutdown", serde_json::json!({"reason":"quit"}))
+            }
+        }
+    }
+
     pub fn load(&mut self, path: impl AsRef<Path>) -> Result<()> {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             bail!("PTC executor is closed");
@@ -370,6 +618,14 @@ impl ProgrammaticToolExecutor {
             bail!("Pi extension {module} registered no tools");
         }
         validate_js_tools(&module, &tools)?;
+        let commands = runtime.get_commands().await?;
+        self.js_commands = commands
+            .into_iter()
+            .map(|command| CommandDef {
+                name: command.name,
+                description: command.description,
+            })
+            .collect();
         self.js_extensions.push(JsExtension {
             module,
             extension_id,
@@ -486,6 +742,7 @@ impl ProgrammaticToolExecutor {
             })
             .collect::<HashMap<_, _>>();
         let js_runtime = self.js_runtime.clone();
+        let host_actions = Arc::clone(&self.host_actions);
         let sequence = Arc::new(std::sync::atomic::AtomicU64::new(
             self.call_sequence.load(std::sync::atomic::Ordering::SeqCst),
         ));
@@ -494,6 +751,7 @@ impl ProgrammaticToolExecutor {
             let js_extension_id = js_routes.get(&(module.clone(), tool.clone())).cloned();
             let js_runtime = js_runtime.clone();
             let sequence = Arc::clone(&sequence);
+            let host_actions = Arc::clone(&host_actions);
             Box::pin(async move {
                 if let Some(extension) = extension {
                     return call_extension(extension, session, &tool, input)
@@ -516,7 +774,14 @@ impl ProgrammaticToolExecutor {
                 });
                 tokio::time::timeout(
                     std::time::Duration::from_secs(60),
-                    runtime.execute(extension_id, tool.clone(), call_id, input, context),
+                    runtime.execute(
+                        extension_id,
+                        tool.clone(),
+                        call_id,
+                        input,
+                        context,
+                        host_actions,
+                    ),
                 )
                 .await
                 .map_err(|_| format!("{module}.{tool}: timed out after 60 seconds"))?
@@ -530,6 +795,138 @@ impl ProgrammaticToolExecutor {
                 .map_err(anyhow::Error::new)?;
         Ok(PTCOutput { stdout, stderr })
     }
+}
+
+#[async_trait::async_trait(?Send)]
+impl LifecycleHook for ProgrammaticToolExecutor {
+    async fn dispatch(
+        &self,
+        event: LifecycleEvent,
+        ctx: &SessionContext,
+    ) -> Result<LifecycleEffect> {
+        let Some(runtime) = &self.js_runtime else {
+            return Ok(LifecycleEffect::None);
+        };
+        let (name, payload) = Self::pi_event(event);
+        eprintln!("lifecycle {name}");
+        let result = runtime
+            .dispatch(
+                name.to_string(),
+                payload,
+                Self::pi_context(ctx),
+                Arc::clone(&self.host_actions),
+            )
+            .await
+            .with_context(|| format!("dispatch Pi event {name}"))?;
+        Ok(match name {
+            "input" if result["action"] == "handled" => LifecycleEffect::Handled,
+            "input" if result["action"] == "transform" => LifecycleEffect::TransformInput {
+                text: result["text"].as_str().unwrap_or_default().to_string(),
+            },
+            "before_agent_start"
+                if result.get("systemPrompt").is_some() || result.get("messages").is_some() =>
+            {
+                LifecycleEffect::BeforeAgentStart {
+                    system_prompt: result["systemPrompt"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    messages: Vec::new(),
+                }
+            }
+            "tool_call" if result["block"].as_bool() == Some(true) => LifecycleEffect::BlockTool {
+                reason: result["reason"]
+                    .as_str()
+                    .unwrap_or("blocked by extension")
+                    .to_string(),
+            },
+            _ => LifecycleEffect::None,
+        })
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl ExtensionHost for ProgrammaticToolExecutor {
+    fn commands(&self) -> Vec<CommandDef> {
+        self.js_commands.clone()
+    }
+    async fn command(&self, name: &str, args: &str, ctx: &SessionContext) -> Result<()> {
+        let runtime = self
+            .js_runtime
+            .as_ref()
+            .context("Pi extension runtime unavailable")?;
+        runtime
+            .command(
+                name.to_string(),
+                args.to_string(),
+                Self::pi_context(ctx),
+                Arc::clone(&self.host_actions),
+            )
+            .await?;
+        Ok(())
+    }
+    fn take_host_actions(&self) -> Vec<HostAction> {
+        self.host_actions.take()
+    }
+}
+
+async fn execute_hostcall_with_state(
+    request: HostcallRequest,
+    state: Arc<HostcallState>,
+) -> Vec<HostcallOutcome> {
+    if let HostcallKind::Events { op } = &request.kind {
+        let action = match op.as_str() {
+            "appendEntry" => Some(HostAction::AppendEntry {
+                kind: request.payload["customType"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                data: request
+                    .payload
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            }),
+            "sendUserMessage" => Some(HostAction::SendUserMessage {
+                text: request.payload["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                deliver_as: request.payload["options"]["deliverAs"]
+                    .as_str()
+                    .unwrap_or("followUp")
+                    .to_string(),
+            }),
+            "sendMessage" => Some(HostAction::SendMessage {
+                message: request.payload.get("message").cloned().unwrap_or_default(),
+                deliver_as: request.payload["options"]["deliverAs"]
+                    .as_str()
+                    .unwrap_or("followUp")
+                    .to_string(),
+                trigger_turn: request.payload["options"]["triggerTurn"]
+                    .as_bool()
+                    .unwrap_or(false),
+            }),
+            _ => None,
+        };
+        if let Some(action) = action {
+            state
+                .actions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(action);
+            return vec![HostcallOutcome::Success(serde_json::Value::Null)];
+        }
+    }
+    if let HostcallKind::Ui { op } = &request.kind {
+        if matches!(
+            op.as_str(),
+            "notify" | "setStatus" | "setWidget" | "setTitle"
+        ) {
+            return vec![HostcallOutcome::Success(serde_json::Value::Null)];
+        }
+    }
+    execute_hostcall(request).await
 }
 
 async fn execute_hostcall(request: HostcallRequest) -> Vec<HostcallOutcome> {
@@ -788,7 +1185,7 @@ mod tests {
     use e_agent_extension::SessionId;
     use e_agent_node_runtime::{NativeCall, NativeFunction, NativeModule, execute_program};
 
-    use crate::tool::ToolExecutor;
+    use e_agent_core::tool::ToolExecutor;
 
     use super::ProgrammaticToolExecutor;
 

@@ -1,4 +1,4 @@
 [workspace]
-members = ["e-agent-core", "e-agent-macros", "e-agent-node-runtime", "e-agent-extension", "tools/web-access", "tools/todo"]
-default-members = ["e-agent-core"]
+members = ["e-agent-core", "e-agent-cli", "e-agent-provider-openai", "e-agent-tool-ptc", "e-agent-macros", "e-agent-node-runtime", "e-agent-extension", "tools/web-access", "tools/todo"]
+default-members = ["e-agent-cli"]
 resolver = "3"
