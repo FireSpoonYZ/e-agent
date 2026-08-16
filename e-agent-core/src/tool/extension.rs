@@ -1,4 +1,4 @@
-use crate::{lifecycle::LifecycleHook, session::SessionContext};
+use crate::{event::AgentEvent, hooks::AgentHooks, session::SessionContext};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommandDef {
@@ -24,7 +24,11 @@ pub enum HostAction {
 }
 
 #[async_trait::async_trait(?Send)]
-pub trait ExtensionHost: LifecycleHook {
+pub trait ExtensionHost: AgentHooks {
+    async fn observe(&self, _event: &AgentEvent, _ctx: &SessionContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn commands(&self) -> Vec<CommandDef>;
     async fn command(&self, name: &str, args: &str, ctx: &SessionContext) -> anyhow::Result<()>;
     fn take_host_actions(&self) -> Vec<HostAction>;

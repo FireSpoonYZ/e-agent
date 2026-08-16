@@ -1,0 +1,22 @@
+[package]
+name = "e-agent-pi-compat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+base64 = "0.22"
+e-agent-core = { path = "../e-agent-core" }
+e-agent-extension = { path = "../e-agent-extension" }
+e-agent-node-runtime = { path = "../e-agent-node-runtime" }
+libloading = "0.9"
+reqwest = "0.13.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.19"

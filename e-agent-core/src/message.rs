@@ -41,6 +41,8 @@ pub struct AssistantMessage {
     /// Absent when the provider does not report token counts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +56,8 @@ pub struct ToolResultMessage {
     /// The content is still meaningful and goes to the model either way.
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
     /// Whether this answers an OpenAI custom tool call rather than a function call.
     #[serde(default, skip_serializing_if = "is_false")]
     pub custom: bool,
@@ -77,6 +81,10 @@ pub enum StopReason {
     Length,
     /// The model declined to answer.
     Refusal,
+    /// Provider execution failed after retaining any partial output.
+    Error,
+    /// The user aborted generation after retaining any partial output.
+    Aborted,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +173,7 @@ impl ToolResultMessage {
             tool_use_id: tool_use_id.into(),
             content: vec![MessageContent::Text { text: text.into() }],
             is_error: false,
+            details: None,
             custom: false,
         }
     }
@@ -178,6 +187,7 @@ impl ToolResultMessage {
                 text: message.to_string(),
             }],
             is_error: true,
+            details: None,
             custom: false,
         }
     }
@@ -216,6 +226,7 @@ mod tests {
                     input_tokens: 12,
                     output_tokens: 3,
                 }),
+                error_message: None,
             }),
             Message::ToolResult(ToolResultMessage::error("call_1", "boom")),
         ];

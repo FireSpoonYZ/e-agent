@@ -5,9 +5,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use e_agent_core::{LifecycleEvent, Session, UserMessage};
+use e_agent_core::{AgentEvent, MessageDelta, Session, UserMessage};
+use e_agent_pi_compat::PiCompat;
 use e_agent_provider_openai::OpenAIProvider;
-use e_agent_tool_ptc::ProgrammaticToolExecutor;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -33,19 +33,19 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     dotenvy::dotenv().context("load .env failed")?;
     let provider = OpenAIProvider::new().context("create openai provider failed")?;
-    let mut tool_executor = ProgrammaticToolExecutor::default();
+    let mut tool_executor = PiCompat::default();
     let tool_paths = std::env::var_os("E_AGENT_TOOL_PATHS")
         .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
         .unwrap_or_default();
     for path in tool_paths {
         tool_executor
-            .load(&path)
+            .load_tool(&path)
             .with_context(|| format!("load {} failed", path.display()))?;
     }
     if let Some(paths) = std::env::var_os("E_AGENT_EXTENSION_PATHS") {
         for path in std::env::split_paths(&paths) {
             tool_executor
-                .load_pi_extension(&path)
+                .load_extension(&path)
                 .await
                 .with_context(|| format!("load Pi extension {} failed", path.display()))?;
         }
@@ -66,30 +66,47 @@ async fn main() -> Result<()> {
         SYSTEM_PROMPT,
         cli.session,
     )?;
+    let mut events = session.subscribe();
     let session_id = session.id();
+    let session_path = session.path().to_owned();
+    let print_mode = cli.prompt.is_some();
     let log = JsonlLog::open(cli.log_dir, session_id)?;
-    session.set_lifecycle_handler(move |event| log.write(event));
-    println!("session id: {session_id}");
-    session.set_message_handler(print_message);
+    let observer = tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    let safe_event = sanitize_event(&event)?;
+                    log.write(&safe_event)?;
+                    if print_mode {
+                        print_event(&event);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    log.write(&serde_json::json!({"event":"observer_lagged","skipped":skipped}))?;
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    if print_mode {
+        println!("session id: {session_id}");
+    } else {
+        eprintln!("session id: {session_id}");
+    }
     session.resume_pending().await?;
     if let Some(prompt) = cli.prompt {
         session.run_one_trun(UserMessage::text(prompt)).await?;
+        eprintln!("session: {}", session_path.display());
+        session.close().await?;
+        drop(session);
     } else {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let mut lines = BufReader::new(tokio::io::stdin()).lines();
-        while let Some(line) = lines.next_line().await? {
-            let prompt = line.trim();
-            if prompt == "/exit" {
-                break;
-            }
-            if prompt.is_empty() {
-                continue;
-            }
-            session.run_one_trun(UserMessage::text(prompt)).await?;
-        }
+        tokio::task::LocalSet::new()
+            .run_until(async move { e_agent_tui::run(session.attach()).await })
+            .await?;
     }
-    eprintln!("session: {}", session.path().display());
-    session.close().await?;
+    observer.await??;
     Ok(())
 }
 
@@ -112,7 +129,7 @@ impl JsonlLog {
         Ok(Arc::new(Self(Mutex::new(file))))
     }
 
-    fn write(&self, event: &LifecycleEvent) -> Result<()> {
+    fn write(&self, event: &impl serde::Serialize) -> Result<()> {
         let mut file = self
             .0
             .lock()
@@ -124,16 +141,72 @@ impl JsonlLog {
     }
 }
 
-fn print_message(message: &e_agent_core::Message) {
-    for content in message.content() {
-        match content {
-            e_agent_core::MessageContent::Text { text } => println!("text: {text}"),
-            e_agent_core::MessageContent::Thinking { thinking, .. } => {
-                println!("thinking: {thinking}")
-            }
-            e_agent_core::MessageContent::ToolUse { name, input, .. } => {
-                println!("tool use: {name}\n{input}")
+fn sanitize_event(event: &AgentEvent) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(event)?;
+    redact_json(&mut value);
+    Ok(value)
+}
+
+fn redact_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                let key = key.to_ascii_lowercase();
+                if [
+                    "api_key",
+                    "apikey",
+                    "token",
+                    "secret",
+                    "password",
+                    "authorization",
+                    "headers",
+                ]
+                .iter()
+                .any(|needle| key.contains(needle))
+                {
+                    *value = serde_json::Value::String("[redacted]".into());
+                } else {
+                    redact_json(value);
+                }
             }
         }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_json),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use e_agent_core::AgentEvent;
+
+    #[test]
+    fn diagnostic_sanitization_redacts_secret_fields() {
+        let event = AgentEvent::ToolExecutionUpdate {
+            id: "call".into(),
+            update: serde_json::json!({"api_key":"secret", "nested":{"authorization":"Bearer secret"}}),
+        };
+        let value = sanitize_event(&event).unwrap();
+        assert_eq!(value["update"]["api_key"], "[redacted]");
+        assert_eq!(value["update"]["nested"]["authorization"], "[redacted]");
+    }
+}
+
+fn print_event(event: &AgentEvent) {
+    match event {
+        AgentEvent::MessageUpdate {
+            delta: MessageDelta::Text(text),
+            ..
+        } => {
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+        }
+        AgentEvent::MessageEnd {
+            message: e_agent_core::Message::Assistant(_),
+            ..
+        } => println!(),
+        AgentEvent::ToolExecutionStart { name, .. } => eprintln!("tool: {name}"),
+        AgentEvent::SessionFatal { error } => eprintln!("session fatal: {error}"),
+        _ => {}
     }
 }

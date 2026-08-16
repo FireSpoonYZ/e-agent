@@ -20,7 +20,7 @@ use url::Url;
 
 use anyhow::{Context, Result, bail};
 use e_agent_core::{
-    Provider,
+    Provider, ProviderEvent, ProviderStream,
     message::{AssistantMessage, Message, MessageContent, StopReason, ToolDef, ToolInput, Usage},
 };
 
@@ -50,11 +50,12 @@ impl OpenAIProvider {
 #[async_trait::async_trait]
 impl Provider for OpenAIProvider {
     type Error = anyhow::Error;
-    async fn send(
+
+    async fn stream(
         &self,
         model: &str,
         context: e_agent_core::message::Context<'_>,
-    ) -> Result<AssistantMessage> {
+    ) -> Result<ProviderStream<Self::Error>> {
         let mut request = CreateResponseArgs::default();
         let (model, effort) = model.split_once(":").unwrap_or((model, "none"));
         let effort = serde_json::from_str::<ReasoningEffort>(&format!(r#""{}""#, effort))
@@ -75,29 +76,112 @@ impl Provider for OpenAIProvider {
         if !context.tools.is_empty() {
             request.tools(context.tools.iter().map(to_tool).collect::<Vec<_>>());
         }
+        let request = request.build()?;
+        let client = self.client.clone();
 
-        let mut stream = self
-            .client
-            .responses()
-            .create_stream(request.build()?)
-            .await?;
-        let mut response = None;
-        let mut output = Vec::new();
-        while let Some(event) = stream.next().await {
-            match event? {
-                ResponseStreamEvent::ResponseOutputItemDone(event) => {
-                    output.push((event.output_index, event.item))
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut stream = client.responses().create_stream(request).await?;
+            let mut had_content = false;
+            let mut terminal = false;
+            while let Some(event) = stream.next().await {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(_) if had_content => {
+                        yield ProviderEvent::Done(StopReason::Stop);
+                        terminal = true;
+                        break;
+                    }
+                    Err(error) => Err(error)?,
+                };
+                match event {
+                    ResponseStreamEvent::ResponseOutputTextDelta(event) => {
+                        had_content = true;
+                        yield ProviderEvent::ContentDelta {
+                            block_index: event.output_index as usize,
+                            delta: MessageContent::Text { text: event.delta },
+                        };
+                    }
+                    ResponseStreamEvent::ResponseRefusalDelta(event) => {
+                        had_content = true;
+                        yield ProviderEvent::ContentDelta {
+                            block_index: event.output_index as usize,
+                            delta: MessageContent::Text { text: event.delta },
+                        };
+                    }
+                    ResponseStreamEvent::ResponseReasoningSummaryTextDelta(event) => {
+                        had_content = true;
+                        yield ProviderEvent::ContentDelta {
+                            block_index: event.output_index as usize,
+                            delta: MessageContent::Thinking { thinking: event.delta, signature: None },
+                        };
+                    }
+                    ResponseStreamEvent::ResponseOutputItemDone(event) => match event.item {
+                        OutputItem::FunctionCall(call) => {
+                            had_content = true;
+                            yield ProviderEvent::ContentDelta {
+                            block_index: event.output_index as usize,
+                            delta: MessageContent::ToolUse {
+                                id: call.call_id,
+                                name: call.name,
+                                input: call.arguments,
+                                custom: false,
+                                item_id: call.id,
+                            },
+                        };
+                        }
+                        OutputItem::CustomToolCall(call) => {
+                            had_content = true;
+                            yield ProviderEvent::ContentDelta {
+                            block_index: event.output_index as usize,
+                            delta: MessageContent::ToolUse {
+                                id: call.call_id,
+                                name: call.name,
+                                input: call.input,
+                                custom: true,
+                                item_id: Some(call.id),
+                            },
+                        };
+                        }
+                        _ => {}
+                    },
+                    ResponseStreamEvent::ResponseCompleted(event) => {
+                        if let Some(usage) = event.response.usage {
+                            yield ProviderEvent::Usage(Usage {
+                                input_tokens: u64::from(usage.input_tokens),
+                                output_tokens: u64::from(usage.output_tokens),
+                            });
+                        }
+                        terminal = true;
+                        yield ProviderEvent::Done(StopReason::Stop);
+                    }
+                    ResponseStreamEvent::ResponseIncomplete(event) => {
+                        if let Some(usage) = event.response.usage {
+                            yield ProviderEvent::Usage(Usage {
+                                input_tokens: u64::from(usage.input_tokens),
+                                output_tokens: u64::from(usage.output_tokens),
+                            });
+                        }
+                        terminal = true;
+                        yield ProviderEvent::Done(StopReason::Length);
+                    }
+                    ResponseStreamEvent::ResponseFailed(event) => {
+                        terminal = true;
+                        let detail = event.response.error
+                            .map(|error| error.message)
+                            .unwrap_or_else(|| "provider response failed".to_string());
+                        yield ProviderEvent::Error(detail);
+                    }
+                    ResponseStreamEvent::ResponseError(event) => {
+                        terminal = true;
+                        yield ProviderEvent::Error(event.message);
+                    }
+                    _ => {}
                 }
-                ResponseStreamEvent::ResponseCompleted(event) => response = Some(event.response),
-                ResponseStreamEvent::ResponseIncomplete(event) => response = Some(event.response),
-                ResponseStreamEvent::ResponseFailed(event) => response = Some(event.response),
-                _ => {}
             }
-        }
-        let mut response = response.context("responses stream ended without a terminal event")?;
-        output.sort_by_key(|(index, _)| *index);
-        response.output = output.into_iter().map(|(_, item)| item).collect();
-        from_response(response)
+            if had_content && !terminal {
+                yield ProviderEvent::Done(StopReason::Stop);
+            }
+        }))
     }
 }
 
@@ -143,21 +227,30 @@ fn to_input_items(messages: &[Message]) -> Vec<InputItem> {
             Message::Assistant(_) => Role::Assistant,
             // A tool result is a top-level item, not a message with a role.
             Message::ToolResult(result) => {
-                let output = result
-                    .content
-                    .iter()
-                    .filter_map(to_input_content)
-                    .collect::<Vec<_>>();
                 items.push(InputItem::Item(if result.custom {
+                    let output = result
+                        .content
+                        .iter()
+                        .filter_map(to_input_content)
+                        .collect::<Vec<_>>();
                     Item::CustomToolCallOutput(CustomToolCallOutput {
                         call_id: result.tool_use_id.clone(),
                         output: CustomToolCallOutputOutput::List(output),
                         id: None,
                     })
                 } else {
+                    let output = result
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            MessageContent::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     Item::FunctionCallOutput(FunctionCallOutputItemParam {
                         call_id: result.tool_use_id.clone(),
-                        output: FunctionCallOutput::Content(output),
+                        output: FunctionCallOutput::Text(output),
                         id: None,
                         status: None,
                     })
@@ -332,6 +425,7 @@ fn from_response(response: Response) -> Result<AssistantMessage> {
             input_tokens: u64::from(usage.input_tokens),
             output_tokens: u64::from(usage.output_tokens),
         }),
+        error_message: None,
     })
 }
 
@@ -416,6 +510,7 @@ mod tests {
                 ],
                 stop_reason: StopReason::ToolUse,
                 usage: None,
+                error_message: None,
             }),
             Message::ToolResult(ToolResultMessage::text("call_1", "1")),
         ];
@@ -497,11 +592,13 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: None,
+                error_message: None,
             }),
             Message::ToolResult(ToolResultMessage {
                 tool_use_id: "call_1".into(),
                 content: vec![MessageContent::text("1")],
                 is_error: false,
+                details: None,
                 custom: true,
             }),
         ];

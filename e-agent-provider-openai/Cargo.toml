@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 async-openai = { version = "0.41.3", features = ["chat-completion", "responses"] }
+async-stream = "0.3"
 async-trait = "0.1.92"
 e-agent-core = { path = "../e-agent-core" }
 futures-util = "0.3.32"

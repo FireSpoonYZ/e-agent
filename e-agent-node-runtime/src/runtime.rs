@@ -21776,6 +21776,64 @@ function __pi_make_extension_ctx(ctx_payload) {
         return undefined;
     }
 
+	    if (eventName === 'context' || eventName === 'tool_call' || eventName === 'tool_result' || eventName === 'message_end') {
+	        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+	        const current = { ...base };
+	        let modified = false;
+
+	        for (const entry of handlers) {
+	            const handler = entry && entry.handler;
+	            if (typeof handler !== 'function') continue;
+	            let result = undefined;
+	            try {
+	                result = await __pi_with_extension_async(
+	                    entry.extensionId,
+	                    () => handler({ type: eventName, ...current }, ctx)
+	                );
+	            } catch (e) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	                if (eventName === 'tool_call') throw e;
+	                continue;
+	            }
+	            if (!result || typeof result !== 'object') continue;
+
+	            if (eventName === 'context' && Array.isArray(result.messages)) {
+	                current.messages = result.messages;
+	                modified = true;
+	            } else if (eventName === 'tool_call') {
+	                if (result.block) return result;
+	                if (result.input !== undefined) {
+	                    current.input = result.input;
+	                    modified = true;
+	                }
+	            } else if (eventName === 'tool_result') {
+	                if (result.content !== undefined) {
+	                    current.content = result.content;
+	                    modified = true;
+	                }
+	                if (result.details !== undefined) {
+	                    current.details = result.details;
+	                    modified = true;
+	                }
+	                if (typeof result.isError === 'boolean') {
+	                    current.isError = result.isError;
+	                    modified = true;
+	                }
+	            } else if (eventName === 'message_end' && result.message !== undefined) {
+	                current.message = result.message;
+	                modified = true;
+	            }
+	        }
+
+	        if (!modified) return undefined;
+	        if (eventName === 'context') return { messages: current.messages };
+	        if (eventName === 'tool_call') return { input: current.input };
+	        if (eventName === 'tool_result') {
+	            return { content: current.content, details: current.details, isError: current.isError };
+	        }
+	        return { message: current.message };
+	    }
+
 	    if (eventName === 'resources_discover') {
 	        const skillPaths = [];
 	        const promptPaths = [];

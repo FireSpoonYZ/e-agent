@@ -7,8 +7,10 @@ edition = "2024"
 anyhow = "1.0.104"
 clap = { version = "4.5.53", features = ["derive"] }
 dotenvy = "0.15.7"
+serde = "1.0.229"
 serde_json = "1.0.151"
 e-agent-core = { path = "../e-agent-core" }
+e-agent-pi-compat = { path = "../e-agent-pi-compat" }
+e-agent-tui = { path = "../e-agent-tui" }
 e-agent-provider-openai = { path = "../e-agent-provider-openai" }
-e-agent-tool-ptc = { path = "../e-agent-tool-ptc" }
 tokio = { version = "1.53.1", features = ["full"] }
