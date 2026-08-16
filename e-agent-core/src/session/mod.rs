@@ -31,6 +31,7 @@ pub struct SessionContext {
 pub struct Session<P: Provider, E: ToolExecutor + ExtensionHost> {
     cwd: PathBuf,
     on_message: Option<Box<dyn Fn(&Message)>>,
+    on_lifecycle: Option<Box<dyn Fn(&LifecycleEvent) -> Result<()>>>,
     model: String,
     system_prompt: String,
     store: JsonlSessionStore,
@@ -69,6 +70,7 @@ impl<P: Provider, E: ToolExecutor + ExtensionHost> Session<P, E> {
             tool_executor,
             cwd: cwd.into(),
             on_message: None,
+            on_lifecycle: None,
             model: model.into(),
             system_prompt: system_prompt.to_string(),
             store: JsonlSessionStore::open(path)?,
@@ -81,6 +83,13 @@ impl<P: Provider, E: ToolExecutor + ExtensionHost> Session<P, E> {
 
     pub fn set_message_handler(&mut self, handler: impl Fn(&Message) + 'static) {
         self.on_message = Some(Box::new(handler));
+    }
+
+    pub fn set_lifecycle_handler(
+        &mut self,
+        handler: impl Fn(&LifecycleEvent) -> Result<()> + 'static,
+    ) {
+        self.on_lifecycle = Some(Box::new(handler));
     }
 
     fn emit_message(&self, message: &Message) {
@@ -111,6 +120,9 @@ impl<P: Provider, E: ToolExecutor + ExtensionHost> Session<P, E> {
     }
 
     async fn dispatch(&mut self, event: LifecycleEvent) -> Result<LifecycleEffect> {
+        if let Some(handler) = &self.on_lifecycle {
+            handler(&event)?;
+        }
         let effect = self.tool_executor.dispatch(event, &self.context()).await?;
         self.apply_actions()?;
         Ok(effect)
@@ -169,18 +181,19 @@ impl<P: Provider, E: ToolExecutor + ExtensionHost> Session<P, E> {
             .rev()
             .find_map(|entry| match entry {
                 store::SessionEntry::Custom { custom_type, data }
-                    if custom_type == "goal-state" && data["goal"]["status"] == "active" =>
+                    if custom_type == "goal-state" =>
                 {
                     Some((
-                        data["goal"]["id"].as_str()?.to_string(),
-                        data["goal"]["text"].as_str()?.to_string(),
+                        data["goal"]["status"] == "active",
+                        data["goal"]["id"].as_str().map(str::to_owned),
+                        data["goal"]["text"].as_str().map(str::to_owned),
                     ))
                 }
                 _ => None,
-            });
+            })
+            .and_then(|(active, id, text)| active.then(|| Some((id?, text?)))?);
         self.ensure_started().await?;
         self.queue.set_idle(true);
-        self.dispatch(LifecycleEvent::AgentSettled).await?;
         if let Some((goal_id, objective)) = resumed_goal {
             self.queue.enqueue(QueuedMessage::FollowUp(format!(
                 "Resume the active goal after process restart. Objective: {objective}\nUse the current goal_id {goal_id} when completing it."

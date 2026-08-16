@@ -10,11 +10,12 @@ use async_openai::{
             CustomToolCallOutputOutput, CustomToolParam, CustomToolParamFormat, EasyInputMessage,
             FunctionCallOutput, FunctionCallOutputItemParam, FunctionTool, FunctionToolCall,
             GrammarSyntax, InputContent, InputItem, InputParam, InputTextContent, Item, OutputItem,
-            OutputMessageContent, ReasoningArgs, ReasoningSummary, Response, Role, Status,
-            SummaryPart, Tool,
+            OutputMessageContent, ReasoningArgs, ReasoningSummary, Response, ResponseStreamEvent,
+            Role, Status, SummaryPart, Tool,
         },
     },
 };
+use futures_util::StreamExt;
 use url::Url;
 
 use anyhow::{Context, Result, bail};
@@ -75,7 +76,27 @@ impl Provider for OpenAIProvider {
             request.tools(context.tools.iter().map(to_tool).collect::<Vec<_>>());
         }
 
-        let response = self.client.responses().create(request.build()?).await?;
+        let mut stream = self
+            .client
+            .responses()
+            .create_stream(request.build()?)
+            .await?;
+        let mut response = None;
+        let mut output = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event? {
+                ResponseStreamEvent::ResponseOutputItemDone(event) => {
+                    output.push((event.output_index, event.item))
+                }
+                ResponseStreamEvent::ResponseCompleted(event) => response = Some(event.response),
+                ResponseStreamEvent::ResponseIncomplete(event) => response = Some(event.response),
+                ResponseStreamEvent::ResponseFailed(event) => response = Some(event.response),
+                _ => {}
+            }
+        }
+        let mut response = response.context("responses stream ended without a terminal event")?;
+        output.sort_by_key(|(index, _)| *index);
+        response.output = output.into_iter().map(|(_, item)| item).collect();
         from_response(response)
     }
 }

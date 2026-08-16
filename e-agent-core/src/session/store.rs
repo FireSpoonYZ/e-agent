@@ -42,13 +42,18 @@ pub struct JsonlSessionStore {
 
 impl JsonlSessionStore {
     pub fn open(path: Option<PathBuf>) -> Result<Self> {
-        let id = SessionId::next();
         let path = path.unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".e/sessions")
-                .join(format!("{id}.jsonl"))
+                .join(format!("{}.jsonl", uuid::Uuid::new_v4()))
         });
+        let id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| uuid::Uuid::parse_str(stem).ok())
+            .map(|uuid| SessionId::from_persisted(uuid.as_u128() as u64))
+            .unwrap_or_else(SessionId::next);
         let mut store = Self {
             id,
             path,
@@ -70,12 +75,12 @@ impl JsonlSessionStore {
                 }
                 store.entries.push(entry);
             }
-            let active_goal = store.entries.iter().rev().any(|entry| {
-                matches!(entry,
-                    SessionEntry::Custom { custom_type, data }
-                        if custom_type == "goal-state" && data["goal"]["status"] == "active"
-                )
-            });
+            let active_goal = store.entries.iter().rev().find_map(|entry| match entry {
+                SessionEntry::Custom { custom_type, data } if custom_type == "goal-state" => {
+                    Some(data["goal"]["status"] == "active")
+                }
+                _ => None,
+            }) == Some(true);
             if active_goal {
                 // Provider custom-call references are process-scoped. Keep durable user and
                 // plain assistant context; the resumed run repeats interrupted tool work.
@@ -164,6 +169,20 @@ impl SessionStore for JsonlSessionStore {
 mod tests {
     use super::*;
     use crate::message::UserMessage;
+
+    #[test]
+    fn creates_unique_uuid_session_paths_and_matching_ids() {
+        let first = JsonlSessionStore::open(None).unwrap();
+        let second = JsonlSessionStore::open(None).unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_ne!(first.id(), second.id());
+        let uuid =
+            uuid::Uuid::parse_str(first.path().file_stem().unwrap().to_str().unwrap()).unwrap();
+        assert_eq!(first.id(), SessionId::from_persisted(uuid.as_u128() as u64));
+
+        let restored = JsonlSessionStore::open(Some(first.path().to_owned())).unwrap();
+        assert_eq!(restored.id(), first.id());
+    }
 
     #[test]
     fn restores_messages_and_custom_entries() {

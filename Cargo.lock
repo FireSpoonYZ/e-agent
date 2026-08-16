@@ -751,6 +751,7 @@ dependencies = [
  "e-agent-core",
  "e-agent-provider-openai",
  "e-agent-tool-ptc",
+ "serde_json",
  "tokio",
 ]
 
@@ -767,6 +768,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -840,6 +842,7 @@ dependencies = [
  "async-trait",
  "dotenvy",
  "e-agent-core",
+ "futures-util",
  "reqwest 0.13.4",
  "serde_json",
  "tokio",

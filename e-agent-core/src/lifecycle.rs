@@ -1,8 +1,10 @@
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::{message::Message, session::SessionContext};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
 pub enum LifecycleEvent {
     SessionStart,
     Input {

@@ -808,7 +808,6 @@ impl LifecycleHook for ProgrammaticToolExecutor {
             return Ok(LifecycleEffect::None);
         };
         let (name, payload) = Self::pi_event(event);
-        eprintln!("lifecycle {name}");
         let result = runtime
             .dispatch(
                 name.to_string(),

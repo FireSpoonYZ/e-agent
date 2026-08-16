@@ -1,4 +1,11 @@
-use e_agent_core::{Session, UserMessage};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+
+use e_agent_core::{LifecycleEvent, Session, UserMessage};
 use e_agent_provider_openai::OpenAIProvider;
 use e_agent_tool_ptc::ProgrammaticToolExecutor;
 
@@ -10,11 +17,15 @@ const SYSTEM_PROMPT: &str = r#"你是运行在 e（一套 coding agent harness�
 #[derive(Debug, Parser)]
 #[command(about = "e-agent")]
 struct Cli {
-    /// 要发送给 agent 的首个提示词
+    /// 单次执行的提示词；提供后不读取 stdin
+    #[arg(short = 'p', long)]
     prompt: Option<String>,
     /// 恢复已有 JSONL session
     #[arg(long)]
     session: Option<std::path::PathBuf>,
+    /// JSONL 日志目录（默认 ~/.e/logs）
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -55,26 +66,62 @@ async fn main() -> Result<()> {
         SYSTEM_PROMPT,
         cli.session,
     )?;
+    let session_id = session.id();
+    let log = JsonlLog::open(cli.log_dir, session_id)?;
+    session.set_lifecycle_handler(move |event| log.write(event));
+    println!("session id: {session_id}");
     session.set_message_handler(print_message);
     session.resume_pending().await?;
     if let Some(prompt) = cli.prompt {
         session.run_one_trun(UserMessage::text(prompt)).await?;
-    }
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Some(line) = lines.next_line().await? {
-        let prompt = line.trim();
-        if prompt == "/exit" {
-            break;
+    } else {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        while let Some(line) = lines.next_line().await? {
+            let prompt = line.trim();
+            if prompt == "/exit" {
+                break;
+            }
+            if prompt.is_empty() {
+                continue;
+            }
+            session.run_one_trun(UserMessage::text(prompt)).await?;
         }
-        if prompt.is_empty() {
-            continue;
-        }
-        session.run_one_trun(UserMessage::text(prompt)).await?;
     }
     eprintln!("session: {}", session.path().display());
     session.close().await?;
     Ok(())
+}
+
+struct JsonlLog(Mutex<std::fs::File>);
+
+impl JsonlLog {
+    fn open(dir: Option<PathBuf>, session_id: impl std::fmt::Display) -> Result<Arc<Self>> {
+        let dir = dir.unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".e/logs")
+        });
+        fs::create_dir_all(&dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("{session_id}.jsonl")))?;
+        Ok(Arc::new(Self(Mutex::new(file))))
+    }
+
+    fn write(&self, event: &LifecycleEvent) -> Result<()> {
+        let mut file = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("JSONL log lock poisoned"))?;
+        serde_json::to_writer(&mut *file, event)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        Ok(())
+    }
 }
 
 fn print_message(message: &e_agent_core::Message) {
