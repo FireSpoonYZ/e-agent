@@ -10,13 +10,16 @@ base64 = "0.22"
 e-agent-core = { path = "../e-agent-core" }
 e-agent-extension = { path = "../e-agent-extension" }
 e-agent-node-runtime = { path = "../e-agent-node-runtime" }
+e-agent-tui = { path = "../e-agent-tui" }
 libloading = "0.9"
 reqwest = "0.13.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["full"] }
+unicode-width = "0.2"
 
 [dev-dependencies]
+sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = "0.7.19"

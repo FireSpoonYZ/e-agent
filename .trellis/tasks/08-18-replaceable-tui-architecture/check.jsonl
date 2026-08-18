@@ -1,0 +1,11 @@
+{"file":".trellis/spec/guides/index.md","reason":"Shared review triggers and false-positive verification rules."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Verify event, input, broker, callback, rendering, and capability flow end to end."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Check that existing core/runtime/TUI contracts are reused and new abstractions are justified."}
+{"file":".trellis/spec/e-agent-tui/backend/quality-guidelines.md","reason":"Quality checks for TUI behavior, rendering, and package boundaries."}
+{"file":".trellis/spec/e-agent-core/backend/quality-guidelines.md","reason":"Confirm no frontend or terminal dependencies leak into core."}
+{"file":".trellis/spec/e-agent-pi-compat/backend/quality-guidelines.md","reason":"Review Pi compatibility behavior, explicit unsupported cases, and failure isolation."}
+{"file":".trellis/spec/e-agent-node-runtime/backend/quality-guidelines.md","reason":"Review JS callback/runtime-thread safety and hostcall completion behavior."}
+{"file":".trellis/spec/e-agent/backend/quality-guidelines.md","reason":"Review CLI composition without duplicated orchestration."}
+{"file":".trellis/tasks/08-18-replaceable-tui-architecture/research/pi-tui-contract.md","reason":"Acceptance source for pinned public pi 0.84.2 UI behavior and fixtures."}
+{"file":".trellis/tasks/08-18-replaceable-tui-architecture/research/repo-boundaries.md","reason":"Acceptance source for current dependency direction, core contracts, and concurrency risks."}
+{"file":".trellis/tasks/08-18-replaceable-tui-architecture/research/critical-architecture-review.md","reason":"Audit implementation against corrected architecture constraints and impossible-claim fixes."}

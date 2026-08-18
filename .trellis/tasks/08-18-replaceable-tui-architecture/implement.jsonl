@@ -1,0 +1,11 @@
+{"file":".trellis/spec/guides/index.md","reason":"Shared pre-development thinking triggers for cross-layer data flow and reuse."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"The TUI protocol crosses CLI, core session ports, Rust frontend, Pi compatibility, and JS runtime boundaries."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse existing SessionAttachment, event projection, runtime hostcalls, and TUI behavior rather than duplicating them."}
+{"file":".trellis/spec/e-agent-tui/backend/index.md","reason":"Package guideline index for the existing TUI package and future facade."}
+{"file":".trellis/spec/e-agent-core/backend/index.md","reason":"Protect the existing core/session dependency boundary while integrating the frontend."}
+{"file":".trellis/spec/e-agent-pi-compat/backend/index.md","reason":"Pi UI compatibility adapter is a first-milestone deliverable."}
+{"file":".trellis/spec/e-agent-node-runtime/backend/index.md","reason":"JS callback retention and UI hostcall execution stay in the node runtime boundary."}
+{"file":".trellis/spec/e-agent/backend/index.md","reason":"CLI is the compile-time frontend composition root."}
+{"file":".trellis/tasks/08-18-replaceable-tui-architecture/research/pi-tui-contract.md","reason":"Pinned pi 0.84.2 public TUI and extension UI contract, lifecycle, and compatibility matrix."}
+{"file":".trellis/tasks/08-18-replaceable-tui-architecture/research/repo-boundaries.md","reason":"Current Rust session, TUI, CLI, Pi hostcall, concurrency, and migration evidence."}
+{"file":".trellis/tasks/08-18-replaceable-tui-architecture/research/critical-architecture-review.md","reason":"Confirmed dependency-cycle, runtime-thread, semantic rendering, and staging corrections."}

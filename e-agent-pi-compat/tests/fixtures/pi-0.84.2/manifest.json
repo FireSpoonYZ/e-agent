@@ -1,0 +1,84 @@
+{
+  "pi_version": "0.84.2",
+  "package": "@earendil-works/pi-coding-agent",
+  "fixtures": [
+    {
+      "path": "extensions/custom-footer.ts",
+      "sha256": "1e5f17bec95a48d407fbcc092faf7e1f6021c30cee4a66ec09bc120412292cb2",
+      "source": "examples/extensions/custom-footer.ts",
+      "provenance": "byte-for-byte public example"
+    },
+    {
+      "path": "extensions/custom-header.ts",
+      "sha256": "5de09cf861d3965201991d6e837d6b68e8a2e80cb89279ee9177cc05d31f723d",
+      "source": "examples/extensions/custom-header.ts",
+      "provenance": "byte-for-byte public example"
+    },
+    {
+      "path": "extensions/entry-renderer.ts",
+      "sha256": "e4c01fcf382972d570ebf37d044e32065eae062fe70987b1b885d75d46aa0b11",
+      "source": "examples/extensions/entry-renderer.ts",
+      "provenance": "byte-for-byte public example"
+    },
+    {
+      "path": "extensions/github-issue-autocomplete.ts",
+      "sha256": "4646ef360e57aa98c787ba21ca2f2e8acb3db30c4db0503e64cdbea4a4c2ac65",
+      "source": "examples/extensions/github-issue-autocomplete.ts",
+      "provenance": "byte-for-byte public example"
+    },
+    {
+      "path": "extensions/mac-system-theme.ts",
+      "sha256": "d7349bae999a798c71b283165e06d0142d41b0264bfdad11ddcb1ec8b62f8710",
+      "source": "examples/extensions/mac-system-theme.ts",
+      "provenance": "byte-for-byte public example"
+    },
+    {
+      "path": "extensions/message-renderer.ts",
+      "sha256": "bedc198df5215c0a758e0743224599003630741a4ff72d4327837ce309e5ec8c",
+      "source": "examples/extensions/message-renderer.ts",
+      "provenance": "byte-for-byte public example"
+    },
+    {
+      "path": "extensions/modal-editor.ts",
+      "sha256": "4742283930949fad1920359540aa9d42c833d2d24eaa49564bfc08f90e328b0d",
+      "source": "examples/extensions/modal-editor.ts",
+      "provenance": "byte-for-byte public example"
+    },
+    {
+      "path": "extensions/overlay-qa-tests.ts",
+      "sha256": "4b1778e9e247c9eb24fe48e13fff0272f6f78b8102b4ed085d03598c3b98773f",
+      "source": "examples/extensions/overlay-qa-tests.ts",
+      "provenance": "byte-for-byte public example"
+    },
+    {
+      "path": "extensions/todo.ts",
+      "sha256": "e46824d00217e25242c186d41837cc84ca81b23f978500323448502a9a424ee2",
+      "source": "examples/extensions/todo.ts",
+      "provenance": "byte-for-byte public example"
+    },
+    {
+      "path": "extensions/widget-placement.ts",
+      "sha256": "ffabd33cf58efb908de2025aac4cb41daf13dbeee24b5ad8dcd0361b43eff6d7",
+      "source": "examples/extensions/widget-placement.ts",
+      "provenance": "byte-for-byte public example"
+    },
+    {
+      "path": "extensions/working-indicator.ts",
+      "sha256": "e88295d765b78fd6aac0e93db92b183ee9b7103dc21577e3c5a42665dfad032c",
+      "source": "examples/extensions/working-indicator.ts",
+      "provenance": "byte-for-byte public example"
+    },
+    {
+      "path": "markdown-transformer.ts",
+      "sha256": "e9a76b7fee9f80e7293c8bde088008391ba8874fa94699c2341411bbf1b5d0b2",
+      "source": "docs/extensions.md:1582-1587",
+      "provenance": "documentation-derived"
+    },
+    {
+      "path": "terminal-input-subscription.ts",
+      "sha256": "87d087620e0a2491577f02d5037aaecfc9e77654cf7be77a49d9dc18b8479dcb",
+      "source": "docs/extensions.md (TerminalInputHandler and ExtensionUIContext declarations)",
+      "provenance": "documentation-derived"
+    }
+  ]
+}

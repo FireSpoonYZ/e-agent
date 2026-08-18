@@ -1,18 +1,16 @@
-use std::{borrow::Cow, collections::BTreeMap, io, time::Duration};
+pub mod broker;
+pub mod component;
+pub mod input;
+pub mod reducer;
+pub mod render;
+pub mod runner;
+pub mod state;
+pub mod terminal;
+pub mod ui_protocol;
 
 use anyhow::Result;
-use crossterm::{
-    event::{
-        DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, EventStream, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
-    },
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use e_agent_core::{
-    AgentEvent, Message, MessageContent, MessageDelta, SessionAttachment, SessionClient,
-    SessionHandle, SessionStatus, StopReason, UserMessage,
-};
+use crossterm::event::EventStream;
+use e_agent_core::{Message, MessageContent, SessionAttachment, SessionStatus, StopReason};
 use futures_util::StreamExt;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
@@ -23,347 +21,201 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use std::{borrow::Cow, io, time::Duration};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-#[derive(Debug, Clone)]
-pub struct ToolState {
-    pub name: String,
-    pub status: String,
-    pub input: String,
-    pub update: Option<serde_json::Value>,
-    pub result: Option<serde_json::Value>,
-    pub is_error: bool,
+pub use state::{AppState, ToolState};
+
+struct RatatuiRenderer {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    components: render::ComponentRegistry,
 }
 
-#[derive(Debug)]
-pub struct AppState {
-    pub messages: Vec<Message>,
-    pub partial_id: Option<String>,
-    pub partial: String,
-    pub thinking: String,
-    pub tool_call_input: String,
-    pub partial_unpersisted: bool,
-    pub tools: BTreeMap<String, ToolState>,
-    pub status: SessionStatus,
-    pub editor: String,
-    pub cursor: usize,
-    pub scroll: u16,
-    pub follow: bool,
-    pub fatal_error: Option<String>,
+impl RatatuiRenderer {
+    fn new() -> Result<Self> {
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        terminal.clear()?;
+        Ok(Self {
+            terminal,
+            components: render::ComponentRegistry::default(),
+        })
+    }
 }
 
-impl AppState {
-    pub fn new(messages: Vec<Message>, status: SessionStatus) -> Self {
-        Self {
-            messages,
-            partial_id: None,
-            partial: String::new(),
-            thinking: String::new(),
-            tool_call_input: String::new(),
-            partial_unpersisted: false,
-            tools: BTreeMap::new(),
-            status,
-            editor: String::new(),
-            cursor: 0,
-            scroll: 0,
-            follow: true,
-            fatal_error: None,
-        }
+impl crate::render::Renderer for RatatuiRenderer {
+    fn components(&mut self) -> &mut render::ComponentRegistry {
+        &mut self.components
     }
 
-    pub fn reduce(&mut self, event: AgentEvent) {
-        match event {
-            AgentEvent::AgentStart { .. } => self.status = SessionStatus::Running,
-            AgentEvent::MessageStart {
-                message_id,
-                message: Message::Assistant(_),
-            } => {
-                self.partial_id = Some(message_id);
-                self.partial.clear();
-                self.thinking.clear();
-                self.tool_call_input.clear();
-                self.partial_unpersisted = false;
-            }
-            AgentEvent::MessageUpdate {
-                message_id,
-                delta: MessageDelta::Thinking(text),
-                ..
-            } if self.partial_id.as_deref() == Some(&message_id) => self.thinking.push_str(&text),
-            AgentEvent::MessageUpdate {
-                message_id,
-                delta: MessageDelta::ToolCallInput(input),
-                ..
-            } if self.partial_id.as_deref() == Some(&message_id) => {
-                self.tool_call_input.push_str(&input)
-            }
-            AgentEvent::MessageUpdate {
-                message_id,
-                delta: MessageDelta::Text(text),
-                ..
-            } if self.partial_id.as_deref() == Some(&message_id) => self.partial.push_str(&text),
-            AgentEvent::MessageEnd {
-                message_id,
-                message,
-            } => {
-                if self.partial_id.as_deref() == Some(&message_id) {
-                    self.partial_id = None;
-                    self.partial.clear();
-                    self.thinking.clear();
-                    self.tool_call_input.clear();
-                    self.partial_unpersisted = false;
-                }
-                self.messages.push(message);
-            }
-            AgentEvent::ToolExecutionStart { id, name, input } => {
-                self.tools.insert(
-                    id,
-                    ToolState {
-                        name,
-                        status: "running".into(),
-                        input,
-                        update: None,
-                        result: None,
-                        is_error: false,
-                    },
-                );
-            }
-            AgentEvent::ToolExecutionUpdate { id, update } => {
-                if let Some(tool) = self.tools.get_mut(&id) {
-                    tool.status = "updating".into();
-                    tool.update = Some(update);
-                }
-            }
-            AgentEvent::ToolExecutionEnd {
-                id,
-                result,
-                is_error,
-                ..
-            } => {
-                if let Some(tool) = self.tools.get_mut(&id) {
-                    tool.status = if is_error { "error" } else { "done" }.into();
-                    tool.result = Some(result);
-                    tool.is_error = is_error;
-                }
-            }
-            AgentEvent::AgentSettled { .. } => self.status = SessionStatus::Idle,
-            AgentEvent::SessionFatal { error } => {
-                self.status = SessionStatus::Fatal;
-                self.partial_unpersisted = !self.partial.is_empty();
-                self.fatal_error = Some(error);
-                for tool in self.tools.values_mut() {
-                    if tool.status == "running" || tool.status == "updating" {
-                        tool.status = "interrupted".into();
-                    }
-                }
-            }
-            AgentEvent::SessionShutdown if self.status != SessionStatus::Fatal => {
-                self.status = SessionStatus::Closed
-            }
-            _ => {}
-        }
-    }
-
-    fn insert(&mut self, ch: char) {
-        let mut chars = self.editor.chars().collect::<Vec<_>>();
-        chars.insert(self.cursor, ch);
-        self.cursor += 1;
-        self.editor = chars.into_iter().collect();
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let mut chars = self.editor.chars().collect::<Vec<_>>();
-        chars.remove(self.cursor - 1);
-        self.cursor -= 1;
-        self.editor = chars.into_iter().collect();
-    }
-
-    fn delete(&mut self) {
-        let mut chars = self.editor.chars().collect::<Vec<_>>();
-        if self.cursor < chars.len() {
-            chars.remove(self.cursor);
-            self.editor = chars.into_iter().collect();
-        }
-    }
-
-    fn move_vertical(&mut self, direction: isize) {
-        let chars = self.editor.chars().collect::<Vec<_>>();
-        let line_start = |index: usize| {
-            chars[..index]
-                .iter()
-                .rposition(|ch| *ch == '\n')
-                .map_or(0, |pos| pos + 1)
+    fn render(
+        &mut self,
+        snapshot: &mut crate::render::RenderSnapshot<'_>,
+        _damage: crate::render::Damage,
+    ) -> Result<()> {
+        let size = self.terminal.size()?;
+        snapshot.size = crate::render::Size {
+            width: size.width,
+            height: size.height,
         };
-        let current_start = line_start(self.cursor);
-        let column = self.cursor - current_start;
-        if direction < 0 {
-            if current_start == 0 {
-                return;
-            }
-            let previous_end = current_start - 1;
-            let previous_start = line_start(previous_end);
-            self.cursor = previous_start + column.min(previous_end - previous_start);
-        } else {
-            let current_end = chars[self.cursor..]
-                .iter()
-                .position(|ch| *ch == '\n')
-                .map(|offset| self.cursor + offset);
-            let Some(current_end) = current_end else {
-                return;
-            };
-            let next_start = current_end + 1;
-            let next_end = chars[next_start..]
-                .iter()
-                .position(|ch| *ch == '\n')
-                .map_or(chars.len(), |offset| next_start + offset);
-            self.cursor = next_start + column.min(next_end - next_start);
-        }
+        let _semantic = self.components.render(snapshot.state, snapshot.size);
+        self.terminal
+            .draw(|frame| render(frame, &mut *snapshot.state))?;
+        Ok(())
     }
-
-    fn scroll_up(&mut self, amount: u16) {
-        self.follow = false;
-        self.scroll = self.scroll.saturating_sub(amount);
-    }
-
-    fn scroll_down(&mut self, amount: u16) {
-        self.scroll = self.scroll.saturating_add(amount);
-    }
-
-    fn take_editor(&mut self) -> Option<String> {
-        if self.editor.trim().is_empty() {
-            return None;
-        }
-        self.cursor = 0;
-        Some(std::mem::take(&mut self.editor))
+    fn shutdown(&mut self, _preserve_screen: bool) -> Result<()> {
+        Ok(())
     }
 }
 
-pub async fn run(mut attachment: SessionAttachment) -> Result<()> {
-    let _guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    terminal.clear()?;
+pub async fn run(attachment: SessionAttachment) -> Result<()> {
+    run_with_broker(attachment, None).await
+}
+
+pub async fn run_with_broker(
+    attachment: SessionAttachment,
+    broker: Option<crate::broker::UiBrokerServer>,
+) -> Result<()> {
+    run_with_options(attachment, broker, crate::render::ScreenMode::Alternate).await
+}
+
+pub async fn run_with_options(
+    mut attachment: SessionAttachment,
+    broker: Option<crate::broker::UiBrokerServer>,
+    screen_mode: crate::render::ScreenMode,
+) -> Result<()> {
+    let renderer = Box::new(RatatuiRenderer::new()?);
+    run_with_renderer_and_broker(&mut attachment, renderer, broker, screen_mode).await
+}
+
+async fn run_with_renderer_and_broker(
+    attachment: &mut SessionAttachment,
+    mut renderer: Box<dyn crate::render::Renderer>,
+    mut broker: Option<crate::broker::UiBrokerServer>,
+    screen_mode: crate::render::ScreenMode,
+) -> Result<()> {
+    let _terminal =
+        terminal::TerminalSession::start(terminal::CrosstermDriver::default(), screen_mode)?;
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut app = AppState::new(attachment.messages, attachment.status);
-    let mut dirty = false;
+    let mut app = AppState::new(std::mem::take(&mut attachment.messages), attachment.status);
+    let mut scheduler = render::RenderScheduler::default();
+    scheduler.request(render::Damage::Full);
+    draw(&mut *renderer, &mut app, scheduler.take())?;
 
-    terminal.draw(|frame| render(frame, &mut app))?;
-    loop {
+    'event_loop: loop {
         tokio::select! {
             event = attachment.events.recv() => match event {
                 Ok(event) => {
-                    app.reduce(event);
-                    dirty = true;
+                    reducer::reduce(&mut app, reducer::AppEvent::Session(event));
+                    scheduler.request(render::Damage::Components);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    app.status = SessionStatus::Fatal;
-                    app.fatal_error = Some(format!("event observer lagged by {skipped} records"));
-                    dirty = true;
+                    reducer::reduce(&mut app, reducer::AppEvent::ObserverLagged(skipped));
+                    scheduler.request(render::Damage::Full);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             event = input.next() => {
                 let Some(Ok(event)) = event else { break };
-                if handle_terminal_event(event, &mut app, &attachment.handle).await? { break; }
-                dirty = true;
+                if let Some(event) = input::InputEvent::from_crossterm(event) {
+                    let consumed = broker.as_ref().is_some_and(|server| {
+                        server.reply_input(event.clone())
+                            || (app.ui.custom_editor.is_some()
+                                && server.publish_input(event.clone()))
+                    });
+                    if !consumed {
+                        if let Some(server) = broker.as_ref() {
+                            server.publish_input(event.clone());
+                        }
+                        let effects = reducer::reduce(&mut app, reducer::AppEvent::Input(event));
+                        if runner::execute_effects(&attachment.handle, broker.as_ref(), effects).await? { break 'event_loop; }
+                    }
+                    scheduler.request(render::Damage::Components);
+                }
             }
-            _ = tick.tick(), if dirty => {
-                terminal.draw(|frame| render(frame, &mut app))?;
-                dirty = false;
+            envelope = async { broker.as_mut().expect("guarded").recv().await }, if broker.is_some() => {
+                if let Some(envelope) = envelope {
+                    if matches!(
+                        envelope.operation,
+                        crate::ui_protocol::UiOperation::TerminalInput { .. }
+                    ) {
+                        broker
+                            .as_ref()
+                            .expect("guarded")
+                            .queue_input_poll(envelope.request);
+                    } else {
+                        let default = broker.as_ref().expect("guarded").default_reply(&envelope);
+                        if matches!(default, crate::ui_protocol::UiReply::Ack) {
+                            let effects = reducer::reduce(&mut app, reducer::AppEvent::Ui(envelope));
+                            runner::execute_effects(&attachment.handle, broker.as_ref(), effects).await?;
+                            renderer.components().invalidate_all(crate::render::InvalidationReason::State);
+                            scheduler.request(render::Damage::Components);
+                        } else {
+                            broker.as_ref().expect("guarded").reply(envelope.request, default);
+                        }
+                    }
+                }
             }
+            _ = tick.tick(), if scheduler.has_damage() => draw(&mut *renderer, &mut app, scheduler.take())?,
         }
     }
-    attachment.handle.abort().await?;
-    attachment.handle.close().await?;
+    let effects = reducer::reduce(&mut app, reducer::AppEvent::Shutdown);
+    runner::execute_effects(&attachment.handle, broker.as_ref(), effects).await?;
+    renderer.shutdown(false)?;
     Ok(())
 }
 
-async fn handle_terminal_event(
-    event: TerminalEvent,
+fn draw(
+    renderer: &mut dyn crate::render::Renderer,
     app: &mut AppState,
-    handle: &SessionClient,
-) -> Result<bool> {
-    if let TerminalEvent::Mouse(event) = event {
-        match event.kind {
-            MouseEventKind::ScrollUp => app.scroll_up(3),
-            MouseEventKind::ScrollDown => app.scroll_down(3),
-            _ => {}
-        }
-        return Ok(false);
-    }
-    let TerminalEvent::Key(KeyEvent {
-        code,
-        modifiers,
-        kind,
-        ..
-    }) = event
-    else {
-        return Ok(false);
-    };
-    if !matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-        return Ok(false);
-    }
-    if code == KeyCode::Esc {
-        return Ok(true);
-    }
-    if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
-        if app.status == SessionStatus::Running {
-            handle.abort().await?;
-            return Ok(false);
-        }
-        return Ok(true);
-    }
-    if app.status == SessionStatus::Fatal {
-        return Ok(false);
-    }
-    match code {
-        KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => app.insert('\n'),
-        KeyCode::Enter => {
-            if let Some(text) = app.take_editor() {
-                let handle = handle.clone();
-                tokio::task::spawn_local(async move {
-                    let _ = handle.prompt(UserMessage::text(text)).await;
-                });
-            }
-        }
-        KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => app.insert(ch),
-        KeyCode::Backspace => app.backspace(),
-        KeyCode::Delete => app.delete(),
-        KeyCode::Left => app.cursor = app.cursor.saturating_sub(1),
-        KeyCode::Right => app.cursor = (app.cursor + 1).min(app.editor.chars().count()),
-        KeyCode::Home => app.cursor = 0,
-        KeyCode::End => app.cursor = app.editor.chars().count(),
-        KeyCode::Up if app.editor.is_empty() => app.scroll_up(1),
-        KeyCode::Down if app.editor.is_empty() => app.scroll_down(1),
-        KeyCode::Up => app.move_vertical(-1),
-        KeyCode::Down => app.move_vertical(1),
-        KeyCode::PageUp => app.scroll_up(10),
-        KeyCode::PageDown => app.scroll_down(10),
-        _ => {}
-    }
-    Ok(false)
+    damage: crate::render::Damage,
+) -> Result<()> {
+    renderer.render(
+        &mut crate::render::RenderSnapshot {
+            size: crate::render::Size {
+                width: 0,
+                height: 0,
+            },
+            state: app,
+        },
+        damage,
+    )
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
     let area = frame.area();
+    let header_height = app.contribution_lines("header").count() as u16;
+    let above_height = app.contribution_lines("widget").count() as u16;
+    let footer_height = app.contribution_lines("footer").count() as u16;
     let editor_height =
         (app.editor.split('\n').count() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(header_height),
             Constraint::Min(1),
+            Constraint::Length(above_height),
             Constraint::Length(editor_height),
+            Constraint::Length(footer_height),
             Constraint::Length(1),
         ])
         .split(area);
 
-    let transcript = transcript(app, chunks[0].width as usize);
+    if header_height > 0 {
+        frame.render_widget(
+            Paragraph::new(
+                app.contribution_lines("header")
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            chunks[0],
+        );
+    }
+    let transcript = transcript(app, chunks[1].width as usize);
     let transcript = Paragraph::new(transcript).wrap(Wrap { trim: false });
-    let line_count = transcript.line_count(chunks[0].width) as u16;
-    let max_scroll = line_count.saturating_sub(chunks[0].height);
+    let line_count = transcript.line_count(chunks[1].width) as u16;
+    let max_scroll = line_count.saturating_sub(chunks[1].height);
     if app.follow {
         app.scroll = max_scroll;
     } else {
@@ -372,33 +224,147 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
             app.follow = true;
         }
     }
-    frame.render_widget(transcript.scroll((app.scroll, 0)), chunks[0]);
+    frame.render_widget(transcript.scroll((app.scroll, 0)), chunks[1]);
 
-    let editor = Paragraph::new(app.editor.as_str()).block(Block::default().borders(Borders::TOP));
-    frame.render_widget(editor, chunks[1]);
+    if above_height > 0 {
+        frame.render_widget(
+            Paragraph::new(
+                app.contribution_lines("widget")
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            chunks[2],
+        );
+    }
+    let editor_text = app
+        .ui
+        .custom_editor
+        .as_ref()
+        .map_or(app.editor.as_str(), |(_, _, content)| content.as_str());
+    let editor = Paragraph::new(editor_text).block(Block::default().borders(Borders::TOP));
+    frame.render_widget(editor, chunks[3]);
     let (row, col) = cursor_position(&app.editor, app.cursor);
-    let x = chunks[1]
+    let x = chunks[3]
         .x
         .saturating_add(col as u16)
         .min(chunks[1].right().saturating_sub(1));
-    let y = chunks[1]
+    let y = chunks[3]
         .y
         .saturating_add(1 + row as u16)
         .min(chunks[1].bottom().saturating_sub(1));
     frame.set_cursor_position(Position::new(x, y));
 
-    let status = app.fatal_error.as_deref().unwrap_or(match app.status {
-        SessionStatus::Idle => "Idle",
-        SessionStatus::Running => "Running",
-        SessionStatus::Fatal => "Fatal",
-        SessionStatus::Closed => "Closed",
+    if footer_height > 0 {
+        frame.render_widget(
+            Paragraph::new(
+                app.contribution_lines("footer")
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            chunks[4],
+        );
+    }
+    let mut status = app.fatal_error.clone().unwrap_or_else(|| match app.status {
+        SessionStatus::Idle => "Idle".into(),
+        SessionStatus::Running => "Running".into(),
+        SessionStatus::Fatal => "Fatal".into(),
+        SessionStatus::Closed => "Closed".into(),
     });
+    let extension_status = app
+        .contribution_lines("status")
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if !extension_status.is_empty() {
+        status.push_str(" · ");
+        status.push_str(&extension_status);
+    }
     let style = if app.status == SessionStatus::Fatal {
         Style::default().fg(Color::Red)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    frame.render_widget(Paragraph::new(Line::styled(status, style)), chunks[2]);
+    frame.render_widget(Paragraph::new(Line::styled(status, style)), chunks[5]);
+
+    if let Some(notification) = app.ui.notifications.back() {
+        let width = area.width.saturating_sub(4).min(60);
+        let popup = ratatui::layout::Rect::new(
+            area.right().saturating_sub(width + 1),
+            1,
+            width,
+            3.min(area.height),
+        );
+        frame.render_widget(ratatui::widgets::Clear, popup);
+        frame.render_widget(
+            Paragraph::new(notification.message.as_str()).block(Block::bordered()),
+            popup,
+        );
+    }
+    if let Some(dialog) = &app.ui.dialog {
+        let width = area.width.saturating_sub(4).min(60);
+        let height = match dialog.dialog {
+            crate::ui_protocol::DialogRequest::Select { ref options, .. } => {
+                (options.len() as u16 + 2).min(area.height)
+            }
+            _ => 5.min(area.height),
+        };
+        let popup = ratatui::layout::Rect::new(
+            area.x + (area.width.saturating_sub(width) / 2),
+            area.y + (area.height.saturating_sub(height) / 2),
+            width,
+            height,
+        );
+        let text = match &dialog.dialog {
+            crate::ui_protocol::DialogRequest::Select { title, options } => format!(
+                "{title}\n{}",
+                options
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| format!(
+                        "{} {value}",
+                        if index == dialog.selected { '›' } else { ' ' }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            crate::ui_protocol::DialogRequest::Confirm { title, message } => {
+                format!("{title}\n{message}\n[y/n]")
+            }
+            crate::ui_protocol::DialogRequest::Input { title, placeholder } => format!(
+                "{title}\n{}",
+                if dialog.text.is_empty() {
+                    placeholder
+                } else {
+                    &dialog.text
+                }
+            ),
+            crate::ui_protocol::DialogRequest::Editor { title, .. } => {
+                format!("{title}\n{}", dialog.text)
+            }
+        };
+        frame.render_widget(ratatui::widgets::Clear, popup);
+        frame.render_widget(Paragraph::new(text).block(Block::bordered()), popup);
+    }
+    for (index, overlay) in app
+        .ui
+        .overlays
+        .iter()
+        .filter(|overlay| !overlay.hidden)
+        .enumerate()
+    {
+        let width = area.width.saturating_sub(4 + index as u16 * 2).min(60);
+        let height = 5.min(area.height);
+        let popup = ratatui::layout::Rect::new(
+            area.x + (area.width.saturating_sub(width) / 2) + index as u16,
+            area.y + (area.height.saturating_sub(height) / 2) + index as u16,
+            width,
+            height,
+        );
+        frame.render_widget(ratatui::widgets::Clear, popup);
+        frame.render_widget(
+            Paragraph::new(overlay.content.as_str()).block(Block::bordered()),
+            popup,
+        );
+    }
 }
 
 fn transcript(app: &AppState, width: usize) -> Text<'static> {
@@ -503,7 +469,76 @@ fn transcript(app: &AppState, width: usize) -> Text<'static> {
             lines.extend(markdown_text(&format!("```json\n{}\n```", result), width).lines);
         }
     }
+    for (frame, _) in app.ui.frames.values() {
+        lines.extend(semantic_frame_lines(frame));
+    }
     Text::from(lines)
+}
+
+fn semantic_frame_lines(frame: &crate::render::SemanticFrame) -> Vec<Line<'static>> {
+    (0..frame.size.height)
+        .map(|row| {
+            let start = usize::from(row) * usize::from(frame.size.width);
+            let end = start + usize::from(frame.size.width);
+            let spans = frame.cells[start..end]
+                .iter()
+                .filter(|cell| !cell.symbol.is_empty())
+                .map(|cell| {
+                    let mut style = Style::default();
+                    if let Some(color) = cell.style.foreground {
+                        style = style.fg(semantic_color(color));
+                    }
+                    if let Some(color) = cell.style.background {
+                        style = style.bg(semantic_color(color));
+                    }
+                    for (enabled, modifier) in [
+                        (cell.style.bold, Modifier::BOLD),
+                        (cell.style.italic, Modifier::ITALIC),
+                        (cell.style.underline, Modifier::UNDERLINED),
+                        (cell.style.inverse, Modifier::REVERSED),
+                        (cell.style.strikethrough, Modifier::CROSSED_OUT),
+                    ] {
+                        if enabled {
+                            style = style.add_modifier(modifier);
+                        }
+                    }
+                    Span::styled(cell.symbol.clone(), style)
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn semantic_color(value: u32) -> Color {
+    let palette = [
+        Color::Black,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Gray,
+    ];
+    match value & 0xff00_0000 {
+        0x0100_0000 => palette[(value & 7) as usize],
+        0x0200_0000 => match value & 7 {
+            0 => Color::DarkGray,
+            1 => Color::LightRed,
+            2 => Color::LightGreen,
+            3 => Color::LightYellow,
+            4 => Color::LightBlue,
+            5 => Color::LightMagenta,
+            6 => Color::LightCyan,
+            _ => Color::White,
+        },
+        _ => Color::Rgb(
+            ((value >> 16) & 0xff) as u8,
+            ((value >> 8) & 0xff) as u8,
+            (value & 0xff) as u8,
+        ),
+    }
 }
 
 fn message_lines(message: &Message, width: usize) -> Vec<Line<'static>> {
@@ -739,24 +774,10 @@ fn cursor_position(text: &str, cursor: usize) -> (usize, usize) {
     (row, col)
 }
 
-struct TerminalGuard;
-impl TerminalGuard {
-    fn enter() -> Result<Self> {
-        enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-        Ok(Self)
-    }
-}
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use e_agent_core::{AgentEvent, MessageDelta, UserMessage};
     use e_agent_core::{AssistantMessage, Usage};
     use ratatui::{Terminal, backend::TestBackend};
 

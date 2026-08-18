@@ -9242,14 +9242,33 @@ export class BorderedLoader {
 }
 
 export class CustomEditor {
-  constructor(_opts = {}) {
+  constructor(_tui, _theme, _keybindings) {
     this.value = "";
   }
 
-  handleInput(_data) {}
+  getText() { return this.value; }
+  getExpandedText() { return this.value; }
+  setText(text) { this.value = String(text ?? ""); }
+  insertTextAtCursor(text) { this.value += String(text ?? ""); }
+  addToHistory(_text) {}
+  setAutocompleteProvider(provider) { this.autocompleteProvider = provider; }
+  setPaddingX(padding) { this.paddingX = padding; }
+  setAutocompleteMaxVisible(max) { this.autocompleteMaxVisible = max; }
+
+  handleInput(data) {
+    const value = String(data ?? "");
+    if (value === "\u007f") {
+      this.value = this.value.slice(0, -1);
+    } else if (value === "\r") {
+      if (typeof this.onSubmit === "function") this.onSubmit(this.value);
+    } else if (value.length === 1 && value.charCodeAt(0) >= 32) {
+      this.value += value;
+      if (typeof this.onChange === "function") this.onChange(this.value);
+    }
+  }
 
   render(_width) {
-    return [];
+    return this.value ? [this.value] : [];
   }
 }
 
@@ -17597,7 +17616,119 @@ globalThis.console = {
             .map_err(|err| Error::Json(Box::new(err)))
     }
 
-    /// Execute one extension command while servicing its hostcalls.
+    /// Snapshot shortcuts registered by loaded extensions.
+    pub async fn get_registered_shortcuts(&self) -> Result<Vec<serde_json::Value>> {
+        self.interrupt_budget.reset();
+        let script = format!(
+            "globalThis.__e_agent_shortcuts = __pi_snapshot_extensions({:?}).flatMap(e => e.shortcuts.map(s => ({{...s, extension_id: e.id}})));",
+            self.bridge_secret
+        );
+        self.eval(&script).await?;
+        serde_json::from_value(self.read_global_json("__e_agent_shortcuts").await?)
+            .map_err(|err| Error::Json(Box::new(err)))
+    }
+
+    /// Execute one registered extension shortcut while servicing its hostcalls.
+    pub async fn execute_extension_shortcut_with_hostcalls<F, Fut>(
+        &self,
+        shortcut: &str,
+        ctx: serde_json::Value,
+        mut dispatch: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: FnMut(HostcallRequest) -> Fut,
+        Fut: Future<Output = Vec<HostcallOutcome>>,
+    {
+        let task_id = format!("shortcut-{}", generate_call_id());
+        let script = format!(
+            "__pi_task_start({secret:?}, {task:?}, __pi_execute_shortcut({secret:?}, {shortcut:?}, {ctx}));",
+            secret = self.bridge_secret,
+            task = task_id,
+            shortcut = shortcut,
+            ctx = serde_json::to_string(&ctx)?,
+        );
+        self.eval(&script).await?;
+        self.wait_extension_task(&task_id, &mut dispatch).await
+    }
+
+    pub async fn dispatch_terminal_input_with_hostcalls<F, Fut>(
+        &self,
+        input: &str,
+        mut dispatch: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: FnMut(HostcallRequest) -> Fut,
+        Fut: Future<Output = Vec<HostcallOutcome>>,
+    {
+        let task_id = format!("terminal-input-{}", generate_call_id());
+        let script = format!(
+            "__pi_task_start({secret:?}, {task:?}, Promise.resolve(__pi_dispatch_terminal_input({secret:?}, {input:?}, true)));",
+            secret = self.bridge_secret,
+            task = task_id,
+            input = input,
+        );
+        self.eval(&script).await?;
+        self.wait_extension_task(&task_id, &mut dispatch).await
+    }
+
+    /// Apply display-only Markdown transforms, retaining the last good result
+    /// when an extension callback throws.
+    pub async fn transform_markdown_with_hostcalls<F, Fut>(
+        &self,
+        markdown: &str,
+        context: serde_json::Value,
+        mut dispatch: F,
+    ) -> Result<String>
+    where
+        F: FnMut(HostcallRequest) -> Fut,
+        Fut: Future<Output = Vec<HostcallOutcome>>,
+    {
+        let task_id = format!("markdown-{}", generate_call_id());
+        let script = format!(
+            "__pi_task_start({secret:?}, {task:?}, Promise.resolve(__pi_transform_markdown({secret:?}, {markdown:?}, {context})));",
+            secret = self.bridge_secret,
+            task = task_id,
+            markdown = markdown,
+            context = serde_json::to_string(&context)?,
+        );
+        self.eval(&script).await?;
+        let value = self.wait_extension_task(&task_id, &mut dispatch).await?;
+        Ok(value.as_str().unwrap_or(markdown).to_owned())
+    }
+
+    /// Render one registered tool component on the JavaScript runtime thread.
+    /// The result is owned ANSI text for the compatibility adapter; a native
+    /// renderer never receives a JavaScript closure.
+    pub async fn render_extension_tool_component(
+        &self,
+        extension_id: &str,
+        tool: &str,
+        slot: &str,
+        payload: serde_json::Value,
+        context: serde_json::Value,
+        width: u16,
+    ) -> Result<Option<Vec<String>>> {
+        self.interrupt_budget.reset();
+        let script = format!(
+            "globalThis.__e_agent_tool_component = __pi_render_tool_component({secret:?}, {extension:?}, {tool:?}, {slot:?}, {payload}, {context}, {width});",
+            secret = self.bridge_secret,
+            extension = extension_id,
+            tool = tool,
+            slot = slot,
+            payload = serde_json::to_string(&payload)?,
+            context = serde_json::to_string(&context)?,
+            width = width,
+        );
+        self.eval(&script).await?;
+        let value = self.read_global_json("__e_agent_tool_component").await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(|err| Error::Json(Box::new(err)))
+    }
+
     pub async fn execute_extension_command_with_hostcalls<F, Fut>(
         &self,
         command: &str,
@@ -20207,6 +20338,13 @@ const __pi_event_bus_index = new Map(); // event_name -> [{ extensionId, handler
 const __pi_provider_index = new Map();  // provider_id -> { extensionId, spec }
 const __pi_shortcut_index = new Map();  // key_id -> { extensionId, key, description, handler }
 const __pi_message_renderer_index = new Map(); // customType -> { extensionId, customType, renderer }
+const __pi_entry_renderer_index = new Map(); // customType -> { extensionId, customType, renderer }
+const __pi_markdown_transformers = []; // { extensionId, transformer }
+const __pi_tool_render_state = new Map(); // extension/tool/call -> { state, lastComponent }
+const __pi_terminal_input_handlers = []; // registration-ordered extension handlers
+const __pi_active_editors = new Map(); // extension -> component
+let __pi_terminal_input_seq = 0;
+let __pi_renderer_entry_seq = 0;
 const __pi_mcp_server_index = new Map(); // server_name -> { extensionId, spec }
 
 // Async task tracking for Rust-driven calls (tool exec, command exec, event dispatch).
@@ -20296,6 +20434,8 @@ function __pi_runtime_registry_snapshot() {
         providers: __pi_map_size_primordial(__pi_provider_index),
         shortcuts: __pi_map_size_primordial(__pi_shortcut_index),
         messageRenderers: __pi_map_size_primordial(__pi_message_renderer_index),
+        entryRenderers: __pi_map_size_primordial(__pi_entry_renderer_index),
+        markdownTransformers: __pi_markdown_transformers.length,
         mcpServers: __pi_map_size_primordial(__pi_mcp_server_index),
         pendingTasks: __pi_map_size_primordial(__pi_tasks),
         pendingHostcalls: __pi_map_size_primordial(__pi_pending_hostcalls),
@@ -20369,6 +20509,13 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
     __pi_map_clear_primordial(__pi_provider_index);
     __pi_map_clear_primordial(__pi_shortcut_index);
     __pi_map_clear_primordial(__pi_message_renderer_index);
+    __pi_map_clear_primordial(__pi_entry_renderer_index);
+    __pi_markdown_transformers.length = 0;
+    __pi_map_clear_primordial(__pi_tool_render_state);
+    __pi_terminal_input_handlers.length = 0;
+    __pi_map_clear_primordial(__pi_active_editors);
+    __pi_terminal_input_seq = 0;
+    __pi_renderer_entry_seq = 0;
     __pi_map_clear_primordial(__pi_mcp_server_index);
     __pi_map_clear_primordial(__pi_tasks);
     __pi_map_clear_primordial(__pi_pending_hostcalls);
@@ -20386,6 +20533,8 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
         after.providers === 0 &&
         after.shortcuts === 0 &&
         after.messageRenderers === 0 &&
+        after.entryRenderers === 0 &&
+        after.markdownTransformers === 0 &&
         after.mcpServers === 0 &&
         after.pendingTasks === 0 &&
         after.pendingHostcalls === 0 &&
@@ -20429,6 +20578,8 @@ function __pi_get_or_create_extension(extension_id, meta) {
             flags: new Map(),
             flagValues: new Map(),
             messageRenderers: new Map(),
+            entryRenderers: new Map(),
+            markdownTransformers: [],
             activeTools: null,
         });
     }
@@ -20456,6 +20607,9 @@ function __pi_current_extension_or_throw() {
     if (!ext) {
         throw new Error('Internal error: active extension not found');
     }
+    if (!('messageRenderers' in ext)) ext.messageRenderers = new Map();
+    if (!('entryRenderers' in ext)) ext.entryRenderers = new Map();
+    if (!('markdownTransformers' in ext)) ext.markdownTransformers = [];
     return ext;
 }
 
@@ -20584,7 +20738,14 @@ function __pi_register_tool(spec) {
         toolSpec.label = spec.label;
     }
 
-    const record = { extensionId: ext.id, spec: toolSpec, execute: spec.execute };
+    const record = {
+        extensionId: ext.id,
+        spec: toolSpec,
+        execute: spec.execute,
+        renderShell: spec.renderShell === 'self' ? 'self' : 'default',
+        renderCall: typeof spec.renderCall === 'function' ? spec.renderCall : undefined,
+        renderResult: typeof spec.renderResult === 'function' ? spec.renderResult : undefined,
+    };
     if (ext.tools.has(name)) {
         throw new Error(`registerTool: duplicate tool in extension ${ext.id}: ${name}`);
     }
@@ -20602,6 +20763,43 @@ function __pi_get_registered_tools() {
     }
     out.sort((a, b) => a.extension_id.localeCompare(b.extension_id) || a.name.localeCompare(b.name));
     return out;
+}
+
+function __pi_component_lines(component, width) {
+    if (!component) return null;
+    const rendered = typeof component.render === 'function' ? component.render(width) : component;
+    if (Array.isArray(rendered)) return rendered.map((line) => String(line ?? ''));
+    if (rendered === undefined || rendered === null) return null;
+    return String(rendered).split('\n');
+}
+
+function __pi_render_tool_component(extensionId, toolName, slot, payload, context, width) {
+    const record = __pi_tool_index.get(String(toolName || ''));
+    if (!record || record.extensionId !== String(extensionId || '')) return null;
+    const renderer = slot === 'call' ? record.renderCall : record.renderResult;
+    if (typeof renderer !== 'function') return null;
+
+    const input = payload && typeof payload === 'object' ? payload : {};
+    const renderContext = context && typeof context === 'object' ? { ...context } : {};
+    const stateKey = `${record.extensionId}:${toolName}:${String(input.toolCallId || '')}`;
+    const cached = __pi_tool_render_state.get(stateKey) || {
+        state: Object.create(null),
+        lastComponent: null,
+    };
+    renderContext.state = cached.state;
+    renderContext.lastComponent = cached.lastComponent;
+    const component = __pi_with_extension_sync(record.extensionId, () => {
+        if (slot === 'call') return renderer(input.args, __pi_make_extension_theme(), renderContext);
+        return renderer(
+            input.result,
+            { expanded: !!input.expanded, isPartial: !!input.isPartial },
+            __pi_make_extension_theme(),
+            renderContext,
+        );
+    });
+    cached.lastComponent = component;
+    __pi_tool_render_state.set(stateKey, cached);
+    return __pi_component_lines(component, Number(width) || 80);
 }
 
 function __pi_register_command(name, spec) {
@@ -20991,9 +21189,26 @@ function __pi_register_message_renderer(customType, renderer) {
     __pi_message_renderer_index.set(typeId, record);
 }
 
-	function __pi_register_hook(event_name, handler) {
-	    const ext = __pi_current_extension_or_throw();
-	    const eventName = String(event_name || '').trim();
+function __pi_register_entry_renderer(customType, renderer) {
+    const ext = __pi_current_extension_or_throw();
+    const typeId = String(customType || '').trim();
+    if (!typeId) throw new Error('registerEntryRenderer: customType is required');
+    if (typeof renderer !== 'function') throw new Error('registerEntryRenderer: renderer must be a function');
+    const record = { customType: typeId, renderer, extensionId: ext.id };
+    ext.entryRenderers.set(typeId, record);
+    __pi_entry_renderer_index.set(typeId, record);
+}
+
+function __pi_register_markdown_transformer(transformer) {
+    const ext = __pi_current_extension_or_throw();
+    if (typeof transformer !== 'function') throw new Error('registerMarkdownTransformer: transformer must be a function');
+    const record = { extensionId: ext.id, transformer };
+    ext.markdownTransformers.push(record);
+    __pi_markdown_transformers.push(record);
+}
+function __pi_register_hook(event_name, handler) {
+    const ext = __pi_current_extension_or_throw();
+    const eventName = String(event_name || '').trim();
 	    if (!eventName) {
 	        throw new Error('on: event name is required');
 	    }
@@ -21163,17 +21378,37 @@ function __pi_set_label(entryId, label) {
     return pi.session('set_label', { targetId: eid, label: l || undefined });
 }
 
+function __pi_publish_registered_renderer(record, value, options, key) {
+    if (!record || typeof record.renderer !== 'function') return;
+    try {
+        const component = __pi_with_extension_sync(record.extensionId, () =>
+            record.renderer(value, options, __pi_make_extension_theme())
+        );
+        const lines = __pi_component_lines(component, 80);
+        if (lines) void pi.ui('render', { key, lines }).catch(() => {});
+    } catch (_) {
+        // Per-item fallback remains native; one renderer cannot poison the session.
+    }
+}
+
 function __pi_append_entry(custom_type, data) {
     const ext = __pi_current_extension_or_throw();
     const customType = String(custom_type || '').trim();
     if (!customType) {
         throw new Error('appendEntry: customType is required');
     }
+    const value = data === undefined ? null : data;
     __pi_events_native('appendEntry', {
         extensionId: ext.id,
         customType: customType,
-        data: data === undefined ? null : data,
+        data: value,
     });
+    __pi_publish_registered_renderer(
+        __pi_entry_renderer_index.get(customType),
+        { customType, data: value },
+        { expanded: false },
+        `entry:${customType}:${__pi_renderer_entry_seq++}`,
+    );
 }
 
 function __pi_send_message(message, options) {
@@ -21183,6 +21418,15 @@ function __pi_send_message(message, options) {
     }
     const opts = options && typeof options === 'object' ? options : {};
     __pi_events_native('sendMessage', { extensionId: ext.id, message: message, options: opts });
+    const customType = String(message.customType || '').trim();
+    if (customType) {
+        __pi_publish_registered_renderer(
+            __pi_message_renderer_index.get(customType),
+            message,
+            { expanded: false, outputPad: 0 },
+            `message:${customType}:${__pi_renderer_entry_seq++}`,
+        );
+    }
 }
 
 function __pi_send_user_message(text, options) {
@@ -21248,6 +21492,11 @@ function __pi_snapshot_extensions() {
             });
         }
 
+        const entry_renderers = [];
+        for (const renderer of ext.entryRenderers.values()) {
+            entry_renderers.push(renderer.customType);
+        }
+
         out.push({
             id: id,
             name: ext.name,
@@ -21259,6 +21508,8 @@ function __pi_snapshot_extensions() {
             mcp_servers: mcp_servers,
             shortcuts: shortcuts,
             message_renderers: message_renderers,
+            entry_renderers: entry_renderers,
+            markdown_transformers: ext.markdownTransformers.length,
             flags: flags,
             event_hooks: Array.from(event_hooks),
             active_tools: Array.isArray(ext.activeTools) ? ext.activeTools.slice() : null,
@@ -21267,6 +21518,21 @@ function __pi_snapshot_extensions() {
     return out;
 }
 
+function __pi_transform_markdown(markdown, context) {
+    let value = String(markdown ?? '');
+    const ctx = context && typeof context === 'object' ? context : {};
+    for (const record of __pi_markdown_transformers) {
+        try {
+            value = __pi_with_extension_sync(record.extensionId, () => {
+                const next = record.transformer(value, ctx);
+                return next === undefined ? value : String(next);
+            });
+        } catch (_) {
+            // Pi keeps output produced so far and continues the chain.
+        }
+    }
+    return value;
+}
 function __pi_count_event_handlers(event_name) {
     const name = String(event_name || '').trim();
     if (!name) return 0;
@@ -21274,15 +21540,66 @@ function __pi_count_event_handlers(event_name) {
         (__pi_event_bus_index.get(name) || []).length;
 }
 
-function __pi_make_extension_theme() {
-    return Object.create(__pi_extension_theme_template);
+function __pi_dispatch_terminal_input(data, includeEditors = true) {
+    let current = String(data ?? '');
+    for (const record of [...__pi_terminal_input_handlers]) {
+        let outcome;
+        try {
+            outcome = __pi_with_extension_sync(record.extensionId, () => record.handler(current));
+        } catch (_) {
+            continue;
+        }
+        if (outcome && outcome.consume) return undefined;
+        if (outcome && typeof outcome.data === 'string') current = outcome.data;
+    }
+    if (includeEditors) {
+        for (const [extensionId, component] of __pi_active_editors.entries()) {
+            try {
+                __pi_with_extension_sync(extensionId, () => component.handleInput?.(current));
+                const lines = __pi_with_extension_sync(extensionId, () => __pi_component_lines(component, 80));
+                if (lines) void __pi_with_extension_sync(extensionId, () =>
+                    pi.ui('setWidget', { widgetKey: '__pi_custom_editor', lines })
+                ).catch(() => {});
+            } catch (_) {
+                __pi_active_editors.delete(extensionId);
+            }
+        }
+    }
+    return current;
+}
+
+function __pi_make_extension_theme(name = 'default') {
+    const theme = Object.create(__pi_extension_theme_template);
+    theme.name = String(name || 'default');
+    return theme;
+}
+
+function __pi_component_text(factory) {
+    if (factory === undefined || factory === null) return '';
+    if (typeof factory !== 'function') return String(factory);
+    try {
+        const component = factory({ requestRender() {} }, __pi_make_extension_theme(), {});
+        if (!component || typeof component.render !== 'function') return '';
+        const lines = component.render(80);
+        return Array.isArray(lines) ? lines.map((line) => String(line ?? '')).join('\n') : String(lines ?? '');
+    } catch (_) {
+        return '';
+    }
 }
 
 const __pi_extension_theme_template = {
-    // Minimal theme shim. Legacy emits ANSI; conformance harness should normalize ANSI away.
-    fg: (_style, text) => String(text === undefined || text === null ? '' : text),
-    bold: (text) => String(text === undefined || text === null ? '' : text),
-    strikethrough: (text) => String(text === undefined || text === null ? '' : text),
+    fg: (style, text) => `\u001b[${({ error: 31, warning: 33, success: 32, accent: 36, dim: 90, muted: 90, border: 34, borderMuted: 90 }[String(style)] || 39)}m${String(text ?? '')}\u001b[39m`,
+    bg: (_style, text) => `\u001b[49m${String(text ?? '')}\u001b[49m`,
+    bold: (text) => `\u001b[1m${String(text ?? '')}\u001b[22m`,
+    italic: (text) => `\u001b[3m${String(text ?? '')}\u001b[23m`,
+    underline: (text) => `\u001b[4m${String(text ?? '')}\u001b[24m`,
+    inverse: (text) => `\u001b[7m${String(text ?? '')}\u001b[27m`,
+    strikethrough: (text) => `\u001b[9m${String(text ?? '')}\u001b[29m`,
+    getFgAnsi: (style) => `\u001b[${({ error: 31, warning: 33, success: 32, accent: 36, dim: 90, muted: 90 }[String(style)] || 39)}m`,
+    getBgAnsi: () => '\u001b[49m',
+    getColorMode: () => 'truecolor',
+    thinkingBorder: (text) => `\u001b[35m${String(text ?? '')}\u001b[39m`,
+    bashBorder: (text) => `\u001b[33m${String(text ?? '')}\u001b[39m`,
 };
 
 function __pi_build_extension_ui_template(hasUI) {
@@ -21294,34 +21611,58 @@ function __pi_build_extension_ui_template(hasUI) {
         }
         return String(value === undefined || value === null ? '' : value);
     };
+    const dialog = (promise, fallback, opts) => {
+        if (!opts || typeof opts !== 'object') return promise;
+        if (opts.signal && opts.signal.aborted) return Promise.resolve(fallback);
+        const races = [promise];
+        if (Number.isFinite(opts.timeout) && opts.timeout >= 0) {
+            races.push(new Promise((resolve) => setTimeout(() => resolve(fallback), opts.timeout)));
+        }
+        if (opts.signal && typeof opts.signal.addEventListener === 'function') {
+            races.push(new Promise((resolve) => opts.signal.addEventListener('abort', () => resolve(fallback), { once: true })));
+        }
+        return Promise.race(races);
+    };
+    let nextCustomComponent = 0;
+    const addTerminalInput = (handler) => {
+        if (typeof handler !== 'function') return () => {};
+        const extensionId = __pi_current_extension_or_throw().id;
+        const record = { id: __pi_terminal_input_seq++, extensionId, handler };
+        __pi_terminal_input_handlers.push(record);
+        return () => {
+            const index = __pi_terminal_input_handlers.indexOf(record);
+            if (index >= 0) __pi_terminal_input_handlers.splice(index, 1);
+        };
+    };
+    const dispatchTerminalInput = (data) => __pi_dispatch_terminal_input(data, false);
+
     return {
-        select: (title, options) => {
+        onTerminalInput: addTerminalInput,
+        __dispatchTerminalInput: dispatchTerminalInput,
+        select: (title, options, opts) => {
             if (!hasUI) return Promise.resolve(undefined);
+            if (opts && opts.signal && opts.signal.aborted) return Promise.resolve(undefined);
             const list = Array.isArray(options) ? options : [];
             const mapped = list.map((v) => String(v));
-            return pi.ui('select', { title: String(title === undefined || title === null ? '' : title), options: mapped });
+            return dialog(pi.ui('select', { title: String(title === undefined || title === null ? '' : title), options: mapped, timeout: opts && opts.timeout }), undefined, opts);
         },
-        confirm: (title, message) => {
+        confirm: (title, message, opts) => {
             if (!hasUI) return Promise.resolve(false);
-            return pi.ui('confirm', {
+            if (opts && opts.signal && opts.signal.aborted) return Promise.resolve(false);
+            return dialog(pi.ui('confirm', {
                 title: String(title === undefined || title === null ? '' : title),
                 message: String(message === undefined || message === null ? '' : message),
-            });
+                timeout: opts && opts.timeout,
+            }), false, opts);
         },
-        input: (title, placeholder, def) => {
+        input: (title, placeholder, opts) => {
             if (!hasUI) return Promise.resolve(undefined);
-            // Legacy extensions typically call input(title, placeholder?, default?)
-            let payloadDefault = def;
-            let payloadPlaceholder = placeholder;
-            if (def === undefined && typeof placeholder === 'string') {
-                payloadDefault = placeholder;
-                payloadPlaceholder = undefined;
-            }
-            return pi.ui('input', {
+            if (opts && opts.signal && opts.signal.aborted) return Promise.resolve(undefined);
+            return dialog(pi.ui('input', {
                 title: String(title === undefined || title === null ? '' : title),
-                placeholder: payloadPlaceholder,
-                default: payloadDefault,
-            });
+                placeholder: placeholder,
+                timeout: opts && opts.timeout,
+            }), undefined, opts);
         },
         editor: (title, def, language) => {
             if (!hasUI) return Promise.resolve(undefined);
@@ -21352,43 +21693,89 @@ function __pi_build_extension_ui_template(hasUI) {
                 text: text, // compat: some UI surfaces only consume `text`
             }).catch(() => {});
         },
-        setFooter: (text) => {
-            const value = toUiText(text);
-            void pi.ui('setStatus', {
-                statusKey: 'footer',
-                statusText: value,
-                text: value,
-            }).catch(() => {});
+        setFooter: (factory) => {
+            if (!hasUI) return;
+            void pi.ui('setFooter', { content: __pi_component_text(factory) }).catch(() => {});
         },
-        setHeader: (text) => {
-            const value = toUiText(text);
-            void pi.ui('setTitle', {
-                title: value,
-                text: value,
-            }).catch(() => {});
+        setHeader: (factory) => {
+            if (!hasUI) return;
+            void pi.ui('setHeader', { content: __pi_component_text(factory) }).catch(() => {});
         },
         setWorkingMessage: (text) => {
-            const value = toUiText(text);
-            void pi.ui('setStatus', {
-                statusKey: 'working',
-                statusText: value,
-                text: value,
-            }).catch(() => {});
+            void pi.ui('setWorkingMessage', { message: text === undefined ? '' : toUiText(text) }).catch(() => {});
         },
-        setWidget: (widgetKey, lines) => {
+        setWorkingVisible: (visible) => {
+            void pi.ui('setWorkingVisible', { visible: Boolean(visible) }).catch(() => {});
+        },
+        setWorkingIndicator: (options) => {
+            void pi.ui('setWorkingIndicator', options || {}).catch(() => {});
+        },
+        setHiddenThinkingLabel: (label) => {
+            void pi.ui('setHiddenThinkingLabel', { label: label === undefined ? '' : String(label) }).catch(() => {});
+        },
+        setWidget: (widgetKey, content, options) => {
             if (!hasUI) return;
             const payload = { widgetKey: String(widgetKey === undefined || widgetKey === null ? '' : widgetKey) };
-            if (Array.isArray(lines)) {
-                payload.lines = lines.map((v) => String(v));
+            if (Array.isArray(content)) {
+                payload.lines = content.map((v) => String(v));
                 payload.widgetLines = payload.lines; // compat with pi-mono RPC naming
                 payload.content = payload.lines.join('\n'); // compat: some UI surfaces expect a single string
+            } else if (content !== undefined) {
+                payload.content = __pi_component_text(content);
             }
+            if (options && options.placement) payload.placement = String(options.placement);
             void pi.ui('setWidget', payload).catch(() => {});
         },
         setTitle: (title) => {
             void pi.ui('setTitle', {
                 title: String(title === undefined || title === null ? '' : title),
             }).catch(() => {});
+        },
+        pasteToEditor: (text) => {
+            void pi.ui('pasteToEditor', { text: String(text === undefined || text === null ? '' : text) }).catch(() => {});
+        },
+        addAutocompleteProvider: function (factory) {
+            if (typeof factory !== 'function') return;
+            if (!Array.isArray(this.__autocompleteFactories)) this.__autocompleteFactories = [];
+            this.__autocompleteFactories.push(factory);
+        },
+        setEditorComponent: function (factory) {
+            const extensionId = __pi_current_extension_or_throw().id;
+            this.__editorGeneration = Number(this.__editorGeneration || 0) + 1;
+            const previous = this.__editorComponent;
+            if (previous && typeof previous.dispose === 'function') {
+                try { previous.dispose(); } catch (_) {}
+            }
+            this.__editorFactory = typeof factory === 'function' ? factory : undefined;
+            this.__editorComponent = undefined;
+            __pi_active_editors.delete(extensionId);
+            if (!this.__editorFactory) {
+                void pi.ui('setWidget', { widgetKey: '__pi_custom_editor', clear: true, lines: [] }).catch(() => {});
+                return;
+            }
+            try {
+                const component = this.__editorFactory(
+                    { requestRender() {} },
+                    this.theme || __pi_make_extension_theme(),
+                    {},
+                );
+                this.__editorComponent = component;
+                __pi_active_editors.set(extensionId, component);
+                const rendered = component && typeof component.render === 'function' ? component.render(80) : [];
+                void pi.ui('setWidget', {
+                    widgetKey: '__pi_custom_editor',
+                    lines: Array.isArray(rendered) ? rendered.map((line) => String(line ?? '')) : [],
+                }).catch(() => {});
+            } catch (_) {
+                this.__editorFactory = undefined;
+                this.__editorComponent = undefined;
+            }
+        },
+        getEditorComponent: function () { return this.__editorFactory; },
+        getToolsExpanded: function () { return Boolean(this.__toolsExpanded); },
+        setToolsExpanded: function (expanded) {
+            this.__toolsExpanded = Boolean(expanded);
+            void pi.ui('setToolsExpanded', { expanded: this.__toolsExpanded }).catch(() => {});
         },
         setEditorText: (text) => {
             void pi.ui('set_editor_text', {
@@ -21406,7 +21793,7 @@ function __pi_build_extension_ui_template(hasUI) {
                 return pi.ui('custom', opts);
             }
 
-            const widgetKey = '__pi_custom_overlay';
+            const widgetKey = `__pi_custom_${nextCustomComponent++}`;
             const parseWidth = (value, fallback) => {
                 if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
                     return Math.max(20, Math.floor(value));
@@ -21446,8 +21833,32 @@ function __pi_build_extension_ui_template(hasUI) {
             const theme = (this && this.theme) || __pi_make_extension_theme();
             const keybindings = {};
             const onDone = (value) => {
+                if (done) return;
                 done = true;
                 doneValue = value;
+            };
+            let handleHidden = false;
+            let handleFocused = Boolean(opts.overlay);
+            const overlayHandle = {
+                hide: () => {
+                    if (done) return;
+                    void pi.ui('custom', { mode: 'hide', widgetKey }).catch(() => {});
+                    onDone(undefined);
+                },
+                setHidden: (hidden) => {
+                    handleHidden = Boolean(hidden);
+                    void pi.ui('custom', { mode: 'setHidden', widgetKey, hidden: handleHidden }).catch(() => {});
+                },
+                isHidden: () => handleHidden,
+                focus: () => {
+                    handleFocused = true;
+                    void pi.ui('custom', { mode: 'focus', widgetKey }).catch(() => {});
+                },
+                unfocus: (_options) => {
+                    handleFocused = false;
+                    void pi.ui('custom', { mode: 'unfocus', widgetKey }).catch(() => {});
+                },
+                isFocused: () => handleFocused,
             };
             const tui = {
                 requestRender: () => {
@@ -21488,13 +21899,17 @@ function __pi_build_extension_ui_template(hasUI) {
                         lines = String(rendered).split('\n');
                     }
                 } catch (_) {
-                    done = true;
+                    onDone(undefined);
                     return;
                 }
                 await pi
                     .ui('setWidget', {
                         widgetKey,
                         lines,
+                        overlay: Boolean(opts.overlay),
+                        nonCapturing: Boolean(
+                            opts.overlayOptions && opts.overlayOptions.nonCapturing
+                        ),
                         title:
                             typeof opts.title === 'string'
                                 ? opts.title
@@ -21513,19 +21928,20 @@ function __pi_build_extension_ui_template(hasUI) {
                     }
                 }
                 if (response.closed || response.cancelled) {
-                    done = true;
+                    onDone(undefined);
                     return;
                 }
                 const keyData = typeof response.key === 'string' ? response.key : null;
-                if (keyData && component && typeof component.handleInput === 'function') {
+                const transformed = keyData === null ? undefined : dispatchTerminalInput(keyData);
+                if (transformed !== undefined && component && typeof component.handleInput === 'function') {
                     try {
-                        component.handleInput(keyData);
-                        const release = toKittyRelease(keyData);
+                        component.handleInput(transformed);
+                        const release = toKittyRelease(transformed);
                         if (release) {
                             component.handleInput(release);
                         }
                     } catch (_) {
-                        done = true;
+                        onDone(undefined);
                         return;
                     }
                     needsRender = true;
@@ -21549,7 +21965,10 @@ function __pi_build_extension_ui_template(hasUI) {
             };
 
             try {
-                component = componentFactory(tui, theme, keybindings, onDone);
+                component = await componentFactory(tui, theme, keybindings, onDone);
+                if (!component || typeof component.render !== 'function') {
+                    throw new Error('ctx.ui.custom() factory must return a component');
+                }
             } catch (err) {
                 disposeComponent();
                 throw err;
@@ -21571,6 +21990,9 @@ function __pi_build_extension_ui_template(hasUI) {
             pollInput();
             needsRender = false;
             await pushFrame();
+            if (opts.overlay && typeof opts.onHandle === 'function') {
+                try { opts.onHandle(overlayHandle); } catch (_) {}
+            }
 
             while (!done) {
                 await __pi_sleep(16);
@@ -21580,7 +22002,12 @@ function __pi_build_extension_ui_template(hasUI) {
             if (pollTimer) clearInterval(pollTimer);
             disposeComponent();
 
-            await pi.ui('setWidget', { widgetKey, clear: true, lines: [] }).catch(() => {});
+            await pi.ui('setWidget', {
+                widgetKey,
+                clear: true,
+                lines: [],
+                overlay: Boolean(opts.overlay),
+            }).catch(() => {});
             await pi
                 .ui('custom', {
                     ...opts,
@@ -21592,27 +22019,29 @@ function __pi_build_extension_ui_template(hasUI) {
 
             return doneValue;
         },
-        getAllThemes: () => {
-            if (!hasUI) return Promise.resolve([]);
-            return pi.ui('getAllThemes', {});
+        getAllThemes: function () {
+            return [
+                { name: 'default', path: undefined },
+                { name: 'dark', path: undefined },
+                { name: 'light', path: undefined },
+            ];
         },
-        getTheme: (name) => {
-            if (!hasUI) return Promise.resolve(undefined);
-            return pi.ui('getTheme', {
-                name: String(name === undefined || name === null ? '' : name),
-            });
+        getTheme: function (name) {
+            const value = String(name ?? '');
+            return this.getAllThemes().some((theme) => theme.name === value)
+                ? __pi_make_extension_theme(value)
+                : undefined;
         },
-        setTheme: (themeOrName) => {
-            if (!hasUI) return Promise.resolve({ success: false, error: 'UI not available' });
-            if (themeOrName && typeof themeOrName === 'object') {
-                const name = themeOrName.name;
-                return pi.ui('setTheme', {
-                    name: String(name === undefined || name === null ? '' : name),
-                });
-            }
-            return pi.ui('setTheme', {
-                name: String(themeOrName === undefined || themeOrName === null ? '' : themeOrName),
-            });
+        setTheme: function (themeOrName) {
+            const name = typeof themeOrName === 'string'
+                ? themeOrName
+                : String((themeOrName && themeOrName.name) || '');
+            const theme = this.getTheme(name);
+            if (!theme) return { success: false, error: `Theme not found: ${name}` };
+            this.theme = theme;
+            this.__themeGeneration = Number(this.__themeGeneration || 0) + 1;
+            void pi.ui('setTheme', { name, generation: this.__themeGeneration }).catch(() => {});
+            return { success: true };
         },
     };
 }
@@ -22531,6 +22960,8 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
     registerMcpServer: __pi_register_mcp_server,
     registerShortcut: __pi_register_shortcut,
     registerMessageRenderer: __pi_register_message_renderer,
+    registerEntryRenderer: __pi_register_entry_renderer,
+    registerMarkdownTransformer: __pi_register_markdown_transformer,
     on: __pi_register_hook,
     registerFlag: __pi_register_flag,
     getFlag: __pi_get_flag,
@@ -24772,6 +25203,7 @@ __pi_export_privileged(
 for (const [name, fn] of Object.entries({
     __pi_runtime_registry_snapshot,
     __pi_get_registered_tools,
+    __pi_render_tool_component,
     __pi_complete_hostcall,
     __pi_fire_timer,
     __pi_dispatch_event,
@@ -24793,6 +25225,8 @@ for (const [name, fn] of Object.entries({
     __pi_execute_tool,
     __pi_execute_command,
     __pi_execute_shortcut,
+    __pi_transform_markdown,
+    __pi_dispatch_terminal_input,
     __pi_provider_stream_simple_start,
     __pi_provider_stream_simple_next,
     __pi_provider_stream_simple_cancel,
@@ -24857,7 +25291,13 @@ mod tests {
             bridge.len(),
             sha256_hex(bridge.as_bytes())
         );
-        for name in ["node:fs", "@mariozechner/pi-ai", "node:child_process"] {
+        for name in [
+            "node:fs",
+            "@mariozechner/pi-ai",
+            "node:child_process",
+            "@mariozechner/pi-coding-agent",
+            "@mariozechner/pi-tui",
+        ] {
             let source = modules.get(name).expect("receipt module must exist");
             eprintln!(
                 "PiJS source receipt: {name} len={} sha256={}",
@@ -24865,22 +25305,22 @@ mod tests {
                 sha256_hex(source.as_bytes())
             );
         }
-        assert_eq!(bridge.len(), 193_144);
+        assert_eq!(bridge.len(), 212_108);
         assert_eq!(
             sha256_hex(bridge.as_bytes()),
-            "c3047ae81da821cf2eee265a6adc4a15a1d951268e40daaad8b2e2fa6540a5e8"
+            "c09806cc602d4c2358992cea9b268483e655147f7b2a6685cfbb1d7019eeb77d"
         );
 
         for (name, expected_len, expected_sha256) in [
             (
                 "node:fs",
-                56_871,
-                "2d07554c39973bfda483a57f7b870916af4950581ab890741fe5203c77bddb78",
+                57_001,
+                "cc2fb764c81525c3d36db93b37e124f02254826a7e469d60387c87c916d7f030",
             ),
             (
                 "@mariozechner/pi-ai",
-                21_658,
-                "26fee747831ab26565ca358b5d8e3aae61c0ff63c51e6489d4cae56ca4ea2142",
+                22_196,
+                "af5887c99738e674f4462c5cd58bbf2fc88861296c590f2270b805419cb9cac6",
             ),
             (
                 "node:child_process",
@@ -24894,13 +25334,13 @@ mod tests {
             ),
             (
                 "@mariozechner/pi-coding-agent",
-                14_966,
-                "96be2fcee80995ef133943c300289b842e469adb7b5f0c58ce778b7eae09ad4d",
+                16_162,
+                "aafbdaea32e660ef05c0e86a5eb217bf9fb9954c567055482a5a68892a67e3a8",
             ),
             (
                 "@mariozechner/pi-tui",
-                8_395,
-                "e51cefc340ec148e6202c7cf8f57b429a34357559c504130e962a5c947f36a84",
+                8_514,
+                "99ae075f5fce4d73596876616790852afb98b5c73c08d95cb78f262e6c06b10e",
             ),
             (
                 "typebox/compile",
@@ -27954,15 +28394,18 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     r"
                     globalThis.renderWidths = [];
                     const ui = __pi_make_extension_ui(__pi_test_secret, true);
-                    void ui.custom((_tui, _theme, _keybindings, onDone) => ({
-                        render(width) {
-                            globalThis.renderWidths.push(width);
-                            if (width === 40) {
-                                onDone(width);
+                    void ui.custom(async (_tui, _theme, _keybindings, onDone) => {
+                        await Promise.resolve();
+                        return {
+                            render(width) {
+                                globalThis.renderWidths.push(width);
+                                if (width === 40) {
+                                    onDone(width);
+                                }
+                                return [`width:${width}`];
                             }
-                            return [`width:${width}`];
-                        }
-                    }), { width: 80 });
+                        };
+                    }, { width: 80 });
                     ",
                 ))
                 .await
@@ -28076,6 +28519,236 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
         });
     }
 
+    #[test]
+    fn pijs_markdown_transformers_continue_after_failure() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "test", { name: "test" });
+                    pi.registerMarkdownTransformer((markdown) => markdown.replace("a", "b"));
+                    pi.registerMarkdownTransformer(() => { throw new Error("broken"); });
+                    pi.registerMarkdownTransformer((markdown, context) => `${markdown}|${context.messageType}|${context.isStreaming}|${context.availableWidth}`);
+                    __pi_end_extension(__pi_test_secret);
+                    "#,
+                ))
+                .await
+                .expect("register transformers");
+            let value = runtime
+                .transform_markdown_with_hostcalls(
+                    "a",
+                    serde_json::json!({"messageType":"assistant", "isStreaming":true, "availableWidth":42}),
+                    |_request| async { Vec::new() },
+                )
+                .await
+                .expect("transform markdown");
+            assert_eq!(value, "b|assistant|true|42");
+            let resized = runtime
+                .transform_markdown_with_hostcalls(
+                    "a",
+                    serde_json::json!({"messageType":"assistant-thinking", "isStreaming":false, "availableWidth":20}),
+                    |_request| async { Vec::new() },
+                )
+                .await
+                .expect("transform resized markdown");
+            assert_eq!(resized, "b|assistant-thinking|false|20");
+        });
+    }
+
+    #[test]
+    fn pijs_tool_component_producer_retains_row_state_and_falls_back_when_absent() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "test", { name: "test" });
+                    pi.registerTool({
+                        name: "view",
+                        description: "view",
+                        parameters: { type: "object", properties: {} },
+                        async execute() { return { content: [] }; },
+                        renderCall(args, _theme, context) {
+                            context.state.count = (context.state.count || 0) + 1;
+                            return { render: (width) => [`call:${args.label}:${context.state.count}:${context.lastComponent ? "reused" : "new"}:${width}`] };
+                        },
+                        renderResult(result, options, _theme, context) {
+                            return { render: () => [`result:${result.text}:${options.isPartial}:${context.state.count}`] };
+                        },
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    "#,
+                ))
+                .await
+                .expect("register renderer");
+
+            let first = runtime
+                .render_extension_tool_component(
+                    "test",
+                    "view",
+                    "call",
+                    serde_json::json!({"toolCallId":"call-1", "args":{"label":"first"}}),
+                    serde_json::json!({}),
+                    24,
+                )
+                .await
+                .expect("render first")
+                .expect("call renderer");
+            assert_eq!(first, vec!["call:first:1:new:24"]);
+
+            let second = runtime
+                .render_extension_tool_component(
+                    "test",
+                    "view",
+                    "call",
+                    serde_json::json!({"toolCallId":"call-1", "args":{"label":"second"}}),
+                    serde_json::json!({}),
+                    24,
+                )
+                .await
+                .expect("render second")
+                .expect("call renderer");
+            assert_eq!(second, vec!["call:second:2:reused:24"]);
+
+            let result = runtime
+                .render_extension_tool_component(
+                    "test",
+                    "view",
+                    "result",
+                    serde_json::json!({"toolCallId":"call-1", "result":{"text":"done"}, "isPartial":false}),
+                    serde_json::json!({}),
+                    24,
+                )
+                .await
+                .expect("render result")
+                .expect("result renderer");
+            assert_eq!(result, vec!["result:done:false:2"]);
+            assert_eq!(
+                runtime
+                    .render_extension_tool_component(
+                        "test",
+                        "missing",
+                        "call",
+                        serde_json::json!({}),
+                        serde_json::json!({}),
+                        24,
+                    )
+                    .await
+                    .expect("missing renderer"),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_theme_editor_and_autocomplete_contracts_are_synchronous_and_stable() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    const ui = __pi_make_extension_ui(__pi_test_secret, true);
+                    const editorFactory = () => ({ render: () => ["EDITOR"], dispose() { globalThis.editorDisposed = true; } });
+                    ui.setEditorComponent(editorFactory);
+                    globalThis.editorFactoryStable = ui.getEditorComponent() === editorFactory;
+                    ui.addAutocompleteProvider((current) => current);
+                    globalThis.autocompleteCount = ui.__autocompleteFactories.length;
+                    globalThis.themeResult = ui.setTheme("dark");
+                    globalThis.themeName = ui.theme.name;
+                    globalThis.themeText = ui.theme.fg("accent", "x");
+                    globalThis.themeList = ui.getAllThemes().map((theme) => theme.name);
+                    ui.setEditorComponent(undefined);
+                    "#,
+                ))
+                .await
+                .expect("exercise UI contracts");
+            assert_eq!(
+                get_global_json(&runtime, "editorFactoryStable").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "autocompleteCount").await,
+                serde_json::json!(1)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "themeResult").await,
+                serde_json::json!({"success":true})
+            );
+            assert_eq!(
+                get_global_json(&runtime, "themeName").await,
+                serde_json::json!("dark")
+            );
+            assert!(
+                get_global_json(&runtime, "themeText")
+                    .await
+                    .as_str()
+                    .unwrap()
+                    .contains("\u{1b}[36m")
+            );
+            assert_eq!(
+                get_global_json(&runtime, "themeList").await,
+                serde_json::json!(["default", "dark", "light"])
+            );
+            assert_eq!(
+                get_global_json(&runtime, "editorDisposed").await,
+                serde_json::json!(true)
+            );
+            let requests = runtime.drain_hostcall_requests();
+            assert!(requests.iter().any(
+                |request| matches!(&request.kind, HostcallKind::Ui { op } if op == "setTheme")
+            ));
+            assert!(requests.iter().any(
+                |request| matches!(&request.kind, HostcallKind::Ui { op } if op == "setWidget")
+            ));
+        });
+    }
+
+    #[test]
+    fn pijs_terminal_input_listeners_transform_consume_and_unsubscribe() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    const ui = __pi_make_extension_ui(__pi_test_secret, true);
+                    const off = ui.onTerminalInput((data) => ({ data: data + "!" }));
+                    globalThis.inputOne = "a!";
+                    const block = ui.onTerminalInput(() => ({ consume: true }));
+                    globalThis.inputTwo = ui.__dispatchTerminalInput("b");
+                    block();
+                    off();
+                    globalThis.inputThree = ui.__dispatchTerminalInput("c");
+                    "#,
+                ))
+                .await
+                .expect("exercise terminal listeners");
+            assert_eq!(
+                get_global_json(&runtime, "inputOne").await,
+                serde_json::json!("a!")
+            );
+            assert_eq!(
+                get_global_json(&runtime, "inputTwo").await,
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                get_global_json(&runtime, "inputThree").await,
+                serde_json::json!("c")
+            );
+        });
+    }
     #[test]
     fn pijs_hostcall_timeout_rejects_promise() {
         futures::executor::block_on(async {

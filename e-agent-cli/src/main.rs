@@ -37,6 +37,18 @@ async fn main() -> Result<()> {
     let tool_paths = std::env::var_os("E_AGENT_TOOL_PATHS")
         .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
         .unwrap_or_default();
+    let print_mode = cli.prompt.is_some();
+    let ui_server = if print_mode {
+        None
+    } else {
+        let capabilities = e_agent_tui::ui_protocol::native_capabilities();
+        let (client, server) = e_agent_tui::broker::channel(capabilities.clone());
+        tool_executor = PiCompat::with_ui(e_agent_pi_compat::PiUiConfig::interactive(
+            client,
+            capabilities,
+        ));
+        Some(server)
+    };
     for path in tool_paths {
         tool_executor
             .load_tool(&path)
@@ -69,7 +81,6 @@ async fn main() -> Result<()> {
     let mut events = session.subscribe();
     let session_id = session.id();
     let session_path = session.path().to_owned();
-    let print_mode = cli.prompt.is_some();
     let log = JsonlLog::open(cli.log_dir, session_id)?;
     let observer = tokio::spawn(async move {
         loop {
@@ -103,7 +114,9 @@ async fn main() -> Result<()> {
         drop(session);
     } else {
         tokio::task::LocalSet::new()
-            .run_until(async move { e_agent_tui::run(session.attach()).await })
+            .run_until(
+                async move { e_agent_tui::run_with_broker(session.attach(), ui_server).await },
+            )
             .await?;
     }
     observer.await??;

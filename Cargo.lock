@@ -1079,13 +1079,16 @@ dependencies = [
  "e-agent-core",
  "e-agent-extension",
  "e-agent-node-runtime",
+ "e-agent-tui",
  "libloading",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
+ "unicode-width",
 ]
 
 [[package]]

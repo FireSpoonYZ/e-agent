@@ -1,3 +1,7 @@
+mod ansi;
+mod renderers;
+mod ui;
+
 use std::{
     collections::{BTreeSet, HashMap},
     ffi::c_void,
@@ -16,6 +20,7 @@ use e_agent_node_runtime::{
 };
 use libloading::Library;
 use serde::Serialize;
+pub use ui::{PI_UI_TARGET, PiUiConfig, pi_operation_support};
 
 use e_agent_core::{
     event::AgentEvent,
@@ -71,6 +76,12 @@ struct JsCommandDef {
     description: String,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct JsShortcutDef {
+    extension_id: String,
+    shortcut: String,
+}
+
 struct HostcallState {
     actions: std::sync::Mutex<Vec<HostAction>>,
 }
@@ -109,6 +120,9 @@ enum JsRuntimeCommand {
     GetCommands {
         reply: tokio::sync::oneshot::Sender<Result<Vec<JsCommandDef>>>,
     },
+    GetShortcuts {
+        reply: tokio::sync::oneshot::Sender<Result<Vec<JsShortcutDef>>>,
+    },
     ExecuteCommand {
         name: String,
         args: String,
@@ -123,6 +137,21 @@ enum JsRuntimeCommand {
         hostcalls: Arc<HostcallState>,
         reply: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
     },
+    ExecuteShortcut {
+        shortcut: String,
+        context: serde_json::Value,
+        hostcalls: Arc<HostcallState>,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
+    },
+    RenderTool {
+        extension_id: String,
+        tool: String,
+        slot: String,
+        payload: serde_json::Value,
+        context: serde_json::Value,
+        width: u16,
+        reply: tokio::sync::oneshot::Sender<Result<Option<Vec<String>>>>,
+    },
     Shutdown,
 }
 
@@ -132,7 +161,7 @@ struct JsRuntimeHandle {
 }
 
 impl JsRuntimeHandle {
-    fn start() -> Result<Self> {
+    fn start(ui: PiUiConfig) -> Result<Self> {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -145,6 +174,7 @@ impl JsRuntimeHandle {
                 match runtime {
                     Ok(host) => host.block_on(local.run_until(async move {
                         let mut config = PiJsRuntimeConfig::default();
+                        config.limits.hostcall_timeout_ms = Some(5_000);
                         config.cwd = std::env::current_dir()
                             .map(|path| path.to_string_lossy().into_owned())
                             .unwrap_or_default();
@@ -159,7 +189,35 @@ impl JsRuntimeHandle {
                                     return;
                                 }
                             };
-                        while let Some(command) = receiver.recv().await {
+                        let mut ui_input = ui.subscribe_input();
+                        let input_hostcalls = HostcallState::new();
+                        loop {
+                            let command = if let Some(input) = ui_input.as_mut() {
+                                tokio::select! {
+                                    command = receiver.recv() => command,
+                                    event = input.recv() => {
+                                        if let Ok(event) = event
+                                            && let Some(data) = crate::ui::pi_input_data(&event)
+                                        {
+                                            let input_ui = ui.clone();
+                                            let hostcalls = Arc::clone(&input_hostcalls);
+                                            let _ = runtime
+                                                .dispatch_terminal_input_with_hostcalls(&data, move |request| {
+                                                    let input_ui = input_ui.clone();
+                                                    let hostcalls = Arc::clone(&hostcalls);
+                                                    async move {
+                                                        execute_hostcall_with_state(request, hostcalls, &input_ui).await
+                                                    }
+                                                })
+                                                .await;
+                                        }
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                receiver.recv().await
+                            };
+                            let Some(command) = command else { break };
                             match command {
                                 JsRuntimeCommand::Load {
                                     extension_id,
@@ -195,6 +253,7 @@ impl JsRuntimeHandle {
                                     hostcalls,
                                     reply,
                                 } => {
+                                    let ui = ui.clone();
                                     let result = runtime
                                         .execute_extension_tool_with_hostcalls(
                                             &extension_id,
@@ -203,10 +262,14 @@ impl JsRuntimeHandle {
                                             input,
                                             context,
                                             move |request| {
-                                                execute_hostcall_with_state(
-                                                    request,
-                                                    Arc::clone(&hostcalls),
-                                                )
+                                                let ui = ui.clone();
+                                                let hostcalls = Arc::clone(&hostcalls);
+                                                async move {
+                                                    execute_hostcall_with_state(
+                                                        request, hostcalls, &ui,
+                                                    )
+                                                    .await
+                                                }
                                             },
                                         )
                                         .await
@@ -229,6 +292,22 @@ impl JsRuntimeHandle {
                                         });
                                     let _ = reply.send(result);
                                 }
+                                JsRuntimeCommand::GetShortcuts { reply } => {
+                                    let result = runtime
+                                        .get_registered_shortcuts()
+                                        .await
+                                        .map_err(anyhow::Error::new)
+                                        .and_then(|value| {
+                                            value
+                                                .into_iter()
+                                                .map(|item| {
+                                                    serde_json::from_value(item)
+                                                        .map_err(anyhow::Error::new)
+                                                })
+                                                .collect()
+                                        });
+                                    let _ = reply.send(result);
+                                }
                                 JsRuntimeCommand::ExecuteCommand {
                                     name,
                                     args,
@@ -236,16 +315,21 @@ impl JsRuntimeHandle {
                                     hostcalls,
                                     reply,
                                 } => {
+                                    let ui = ui.clone();
                                     let result = runtime
                                         .execute_extension_command_with_hostcalls(
                                             &name,
                                             &args,
                                             context,
                                             move |request| {
-                                                execute_hostcall_with_state(
-                                                    request,
-                                                    Arc::clone(&hostcalls),
-                                                )
+                                                let ui = ui.clone();
+                                                let hostcalls = Arc::clone(&hostcalls);
+                                                async move {
+                                                    execute_hostcall_with_state(
+                                                        request, hostcalls, &ui,
+                                                    )
+                                                    .await
+                                                }
                                             },
                                         )
                                         .await
@@ -259,17 +343,70 @@ impl JsRuntimeHandle {
                                     hostcalls,
                                     reply,
                                 } => {
+                                    let ui = ui.clone();
                                     let result = runtime
                                         .dispatch_extension_event_with_hostcalls(
                                             &name,
                                             payload,
                                             context,
                                             move |request| {
-                                                execute_hostcall_with_state(
-                                                    request,
-                                                    Arc::clone(&hostcalls),
-                                                )
+                                                let ui = ui.clone();
+                                                let hostcalls = Arc::clone(&hostcalls);
+                                                async move {
+                                                    execute_hostcall_with_state(
+                                                        request, hostcalls, &ui,
+                                                    )
+                                                    .await
+                                                }
                                             },
+                                        )
+                                        .await
+                                        .map_err(anyhow::Error::new);
+                                    let _ = reply.send(result);
+                                }
+                                JsRuntimeCommand::ExecuteShortcut {
+                                    shortcut,
+                                    context,
+                                    hostcalls,
+                                    reply,
+                                } => {
+                                    let ui = ui.clone();
+                                    let result = runtime
+                                        .execute_extension_shortcut_with_hostcalls(
+                                            &shortcut,
+                                            context,
+                                            move |request| {
+                                                let ui = ui.clone();
+                                                let hostcalls = Arc::clone(&hostcalls);
+                                                async move {
+                                                    execute_hostcall_with_state(
+                                                        request, hostcalls, &ui,
+                                                    )
+                                                    .await
+                                                }
+                                            },
+                                        )
+                                        .await
+                                        .map_err(anyhow::Error::new);
+                                    let _ = reply.send(result);
+                                }
+                                JsRuntimeCommand::RenderTool {
+                                    extension_id,
+                                    tool,
+                                    slot,
+                                    payload,
+                                    context,
+                                    width,
+                                    reply,
+                                } => {
+                                    let result = runtime
+                                        .render_extension_tool_component(
+                                            &extension_id,
+                                            &tool,
+                                            &slot,
+                                            payload,
+                                            context,
+                                            width,
                                         )
                                         .await
                                         .map_err(anyhow::Error::new);
@@ -379,6 +516,56 @@ impl JsRuntimeHandle {
         receive.await.context("Pi extension runtime stopped")?
     }
 
+    async fn shortcuts(&self) -> Result<Vec<JsShortcutDef>> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(JsRuntimeCommand::GetShortcuts { reply })
+            .map_err(|_| anyhow::anyhow!("Pi extension runtime is shut down"))?;
+        receive.await.context("Pi extension runtime stopped")?
+    }
+
+    async fn shortcut(
+        &self,
+        shortcut: String,
+        context: serde_json::Value,
+        hostcalls: Arc<HostcallState>,
+    ) -> Result<serde_json::Value> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(JsRuntimeCommand::ExecuteShortcut {
+                shortcut,
+                context,
+                hostcalls,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("Pi extension runtime is shut down"))?;
+        receive.await.context("Pi extension runtime stopped")?
+    }
+
+    async fn render_tool(
+        &self,
+        extension_id: String,
+        tool: String,
+        slot: String,
+        payload: serde_json::Value,
+        context: serde_json::Value,
+        width: u16,
+    ) -> Result<Option<Vec<String>>> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(JsRuntimeCommand::RenderTool {
+                extension_id,
+                tool,
+                slot,
+                payload,
+                context,
+                width,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("Pi extension runtime is shut down"))?;
+        receive.await.context("Pi extension runtime stopped")?
+    }
+
     fn shutdown(&self) {
         let _ = self.sender.send(JsRuntimeCommand::Shutdown);
     }
@@ -392,6 +579,8 @@ pub struct PiCompat {
     host_actions: Arc<HostcallState>,
     closed: std::sync::atomic::AtomicBool,
     call_sequence: std::sync::atomic::AtomicU64,
+    ui: PiUiConfig,
+    tool_calls: std::sync::Mutex<HashMap<String, (String, String)>>,
 }
 
 impl Default for PiCompat {
@@ -404,6 +593,8 @@ impl Default for PiCompat {
             host_actions: HostcallState::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
             call_sequence: std::sync::atomic::AtomicU64::new(0),
+            ui: PiUiConfig::headless(),
+            tool_calls: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -413,7 +604,7 @@ impl ToolExecutor for PiCompat {
     type Error = anyhow::Error;
 
     fn tool_defs(&self) -> Vec<ToolDef> {
-        vec![ToolDef {
+        let mut definitions = vec![ToolDef {
             name: "node".into(),
             description: format!(
                 "Execute one complete TypeScript ES module in the Node-compatible QuickJS runtime. Pass the complete program in the `code` field. Import only modules listed in the catalog, using static top-level imports such as `import {{ web_search }} from \"web_access\"`. Never import `pi-extension`, use dynamic `import()`, or use `require()` for catalog modules. Call every async function with one object argument and await it. Rust tools additionally retain legacy positional compatibility. The output_schema is authoritative. The unified module catalog follows:\n{}",
@@ -426,15 +617,72 @@ impl ToolExecutor for PiCompat {
                 "required": ["code"],
                 "additionalProperties": false
             })),
-        }]
+        }];
+        let mut names = BTreeSet::from(["node"]);
+        for extension in &self.js_extensions {
+            for tool in &extension.tools {
+                if names.insert(tool.name.as_str()) {
+                    definitions.push(ToolDef {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        input: ToolInput::Json(tool.parameters.clone()),
+                    });
+                }
+            }
+        }
+        definitions
     }
 
     async fn call(
         &self,
         session: SessionId,
-        _name: &str,
+        name: &str,
         code: String,
     ) -> Result<ToolOutput, Self::Error> {
+        if name != "node"
+            && let Some((extension_id, tool)) = self.js_extensions.iter().find_map(|extension| {
+                extension
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .map(|tool| (extension.extension_id.clone(), tool.name.clone()))
+            })
+        {
+            let runtime = self
+                .js_runtime
+                .as_ref()
+                .context("Pi extension runtime unavailable")?;
+            let input =
+                serde_json::from_str(&code).unwrap_or_else(|_| serde_json::Value::String(code));
+            let call_id = format!(
+                "direct-{}-{}",
+                session.0,
+                self.call_sequence
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            let value = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                runtime.execute(
+                    extension_id,
+                    tool,
+                    call_id,
+                    input,
+                    serde_json::json!({
+                        "cwd": std::env::current_dir()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        "mode": self.ui.mode(),
+                        "hasUI": self.ui.has_ui(),
+                        "sessionId": session.0.to_string(),
+                    }),
+                    Arc::clone(&self.host_actions),
+                ),
+            )
+            .await
+            .context("Pi extension tool timed out")??;
+            return serde_json::from_value(value).context("invalid Pi extension tool result");
+        }
+
         let code = serde_json::from_str::<serde_json::Value>(&code)
             .ok()
             .and_then(|value| value["code"].as_str().map(ToOwned::to_owned))
@@ -476,9 +724,16 @@ impl ToolExecutor for PiCompat {
 }
 
 impl PiCompat {
-    fn pi_context(ctx: &SessionContext) -> serde_json::Value {
+    pub fn with_ui(ui: PiUiConfig) -> Self {
+        Self {
+            ui,
+            ..Self::default()
+        }
+    }
+
+    fn pi_context(&self, ctx: &SessionContext) -> serde_json::Value {
         serde_json::json!({
-            "cwd": ctx.cwd.to_string_lossy(), "mode": "print", "hasUI": false,
+            "cwd": ctx.cwd.to_string_lossy(), "mode": self.ui.mode(), "hasUI": self.ui.has_ui(),
             "sessionId": ctx.session_id.to_string(), "sessionEntries": ctx.entries,
             "sessionBranch": ctx.entries, "isIdle": ctx.idle, "hasPendingMessages": !ctx.idle,
         })
@@ -631,7 +886,7 @@ impl PiCompat {
         }
         let extension_id = format!("ptc/{module}");
         if self.js_runtime.is_none() {
-            self.js_runtime = Some(JsRuntimeHandle::start()?);
+            self.js_runtime = Some(JsRuntimeHandle::start(self.ui.clone())?);
         }
         let runtime = self.js_runtime.as_ref().expect("runtime initialized");
         let tools = runtime
@@ -647,12 +902,43 @@ impl PiCompat {
                 description: command.description,
             })
             .collect();
+        let shortcuts = runtime.shortcuts().await?;
+        let bindings = shortcuts
+            .into_iter()
+            .filter(|shortcut| shortcut.extension_id == extension_id)
+            .map(|shortcut| (shortcut.shortcut, format!("pi.shortcut.{extension_id}")))
+            .collect::<Vec<_>>();
+        if !bindings.is_empty() {
+            let _ = self
+                .ui
+                .execute_hostcall(
+                    &extension_id,
+                    "setKeybindings",
+                    serde_json::json!({"entries": bindings}),
+                )
+                .await;
+        }
         self.js_extensions.push(JsExtension {
             module,
             extension_id,
             tools,
         });
         Ok(())
+    }
+
+    pub async fn shortcut(&self, shortcut: &str, ctx: &SessionContext) -> Result<bool> {
+        let Some(runtime) = &self.js_runtime else {
+            return Ok(false);
+        };
+        runtime
+            .shortcut(
+                shortcut.to_string(),
+                self.pi_context(ctx),
+                Arc::clone(&self.host_actions),
+            )
+            .await
+            .with_context(|| format!("execute Pi shortcut {shortcut}"))?;
+        Ok(true)
     }
 
     fn catalog(&self) -> Vec<PtcToolCatalog> {
@@ -767,12 +1053,14 @@ impl PiCompat {
         let sequence = Arc::new(std::sync::atomic::AtomicU64::new(
             self.call_sequence.load(std::sync::atomic::Ordering::SeqCst),
         ));
+        let ui = self.ui.clone();
         let call: NativeCall = Arc::new(move |module, tool, input| {
             let extension = extensions.get(&module).cloned();
             let js_extension_id = js_routes.get(&(module.clone(), tool.clone())).cloned();
             let js_runtime = js_runtime.clone();
             let sequence = Arc::clone(&sequence);
             let host_actions = Arc::clone(&host_actions);
+            let ui = ui.clone();
             Box::pin(async move {
                 if let Some(extension) = extension {
                     return call_extension(extension, session, &tool, input)
@@ -791,7 +1079,7 @@ impl PiCompat {
                 );
                 let context = serde_json::json!({
                     "cwd": std::env::current_dir().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default(),
-                    "mode": "print", "hasUI": false, "sessionId": session.0.to_string()
+                    "mode": ui.mode(), "hasUI": ui.has_ui(), "sessionId": session.0.to_string()
                 });
                 tokio::time::timeout(
                     std::time::Duration::from_secs(60),
@@ -819,6 +1107,100 @@ impl PiCompat {
 }
 
 impl PiCompat {
+    async fn render_tool_event(&self, event: &AgentEvent, ctx: &SessionContext) {
+        let (id, extension, name, slot, payload) = match event {
+            AgentEvent::ToolExecutionStart { id, name, input } => {
+                let extension = self
+                    .js_extensions
+                    .iter()
+                    .find(|extension| extension.tools.iter().any(|tool| tool.name == *name))
+                    .map(|extension| extension.extension_id.clone());
+                let Some(extension) = extension else { return };
+                self.tool_calls
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(id.clone(), (extension.clone(), name.clone()));
+                (
+                    id.clone(),
+                    extension.clone(),
+                    name.clone(),
+                    "call",
+                    serde_json::json!({"toolCallId":id,"args":serde_json::from_str::<serde_json::Value>(input).unwrap_or_else(|_| serde_json::Value::String(input.clone()))}),
+                )
+            }
+            AgentEvent::ToolExecutionUpdate { id, update } => {
+                let Some((extension, name)) = self
+                    .tool_calls
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(id)
+                    .cloned()
+                else {
+                    return;
+                };
+                (
+                    id.clone(),
+                    extension,
+                    name,
+                    "result",
+                    serde_json::json!({"toolCallId":id,"result":update,"isPartial":true}),
+                )
+            }
+            AgentEvent::ToolExecutionEnd {
+                id,
+                name,
+                result,
+                is_error,
+            } => {
+                let extension = self
+                    .tool_calls
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(id)
+                    .map(|(extension, _)| extension)
+                    .or_else(|| {
+                        self.js_extensions
+                            .iter()
+                            .find(|extension| extension.tools.iter().any(|tool| tool.name == *name))
+                            .map(|extension| extension.extension_id.clone())
+                    });
+                let Some(extension) = extension else { return };
+                (
+                    id.clone(),
+                    extension,
+                    name.clone(),
+                    "result",
+                    serde_json::json!({"toolCallId":id,"result":result,"isPartial":false,"isError":is_error}),
+                )
+            }
+            _ => return,
+        };
+        let Some(runtime) = &self.js_runtime else {
+            return;
+        };
+        let Ok(Some(lines)) = runtime
+            .render_tool(
+                extension.clone(),
+                name,
+                slot.into(),
+                payload,
+                self.pi_context(ctx),
+                80,
+            )
+            .await
+        else {
+            return;
+        };
+        let _ = self
+            .ui
+            .execute_hostcall(
+                &extension,
+                "render",
+                serde_json::json!({"key":id,"lines":lines}),
+            )
+            .await;
+    }
+
     async fn dispatch_pi(
         &self,
         name: &str,
@@ -832,7 +1214,7 @@ impl PiCompat {
             .dispatch(
                 name.to_string(),
                 payload,
-                Self::pi_context(ctx),
+                self.pi_context(ctx),
                 Arc::clone(&self.host_actions),
             )
             .await
@@ -975,6 +1357,7 @@ impl AgentHooks for PiCompat {
 #[async_trait::async_trait(?Send)]
 impl ExtensionHost for PiCompat {
     async fn observe(&self, event: &AgentEvent, ctx: &SessionContext) -> Result<()> {
+        self.render_tool_event(event, ctx).await;
         let Some((name, payload)) = Self::pi_event(event) else {
             return Ok(());
         };
@@ -994,7 +1377,7 @@ impl ExtensionHost for PiCompat {
             .command(
                 name.to_string(),
                 args.to_string(),
-                Self::pi_context(ctx),
+                self.pi_context(ctx),
                 Arc::clone(&self.host_actions),
             )
             .await?;
@@ -1008,6 +1391,7 @@ impl ExtensionHost for PiCompat {
 async fn execute_hostcall_with_state(
     request: HostcallRequest,
     state: Arc<HostcallState>,
+    ui: &PiUiConfig,
 ) -> Vec<HostcallOutcome> {
     if let HostcallKind::Events { op } = &request.kind {
         let action = match op.as_str() {
@@ -1053,13 +1437,8 @@ async fn execute_hostcall_with_state(
             return vec![HostcallOutcome::Success(serde_json::Value::Null)];
         }
     }
-    if let HostcallKind::Ui { op } = &request.kind {
-        if matches!(
-            op.as_str(),
-            "notify" | "setStatus" | "setWidget" | "setTitle"
-        ) {
-            return vec![HostcallOutcome::Success(serde_json::Value::Null)];
-        }
+    if matches!(request.kind, HostcallKind::Ui { .. }) {
+        return ui.execute(request).await;
     }
     execute_hostcall(request).await
 }
@@ -1394,14 +1773,38 @@ impl PiCompat {
             },
             PiCapability {
                 name: "registerShortcut",
-                status: CapabilityStatus::Unsupported,
+                status: CapabilityStatus::Partial,
+            },
+            PiCapability {
+                name: "registerMessageRenderer",
+                status: CapabilityStatus::Partial,
+            },
+            PiCapability {
+                name: "registerEntryRenderer",
+                status: CapabilityStatus::Partial,
+            },
+            PiCapability {
+                name: "registerMarkdownTransformer",
+                status: CapabilityStatus::Partial,
+            },
+            PiCapability {
+                name: "onTerminalInput",
+                status: CapabilityStatus::Partial,
             },
             PiCapability {
                 name: "registerFlag",
                 status: CapabilityStatus::Unsupported,
             },
             PiCapability {
-                name: "custom-ui",
+                name: "pi-ui-0.84.2",
+                status: CapabilityStatus::Partial,
+            },
+            PiCapability {
+                name: "terminal-images",
+                status: CapabilityStatus::Unsupported,
+            },
+            PiCapability {
+                name: "undocumented-pi-internals",
                 status: CapabilityStatus::Unsupported,
             },
         ]
@@ -1464,7 +1867,22 @@ mod tests {
     use e_agent_extension::SessionId;
     use tokio_util::sync::CancellationToken;
 
-    use super::{CapabilityStatus, PiCompat};
+    use super::{CapabilityStatus, PiCompat, PiUiConfig};
+
+    fn frame_text(frame: &e_agent_tui::render::SemanticFrame) -> String {
+        (0..frame.size.height)
+            .map(|row| {
+                frame.cells[usize::from(row) * usize::from(frame.size.width)
+                    ..usize::from(row + 1) * usize::from(frame.size.width)]
+                    .iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     fn context() -> SessionContext {
         SessionContext {
@@ -1503,8 +1921,325 @@ export default function (pi) {
             .await
             .unwrap();
         assert_eq!(compat.commands().len(), 1);
+        assert!(compat.tool_defs().iter().any(|tool| tool.name == "starts"));
+        let direct = compat
+            .call(ctx.session_id, "starts", "{}".into())
+            .await
+            .unwrap();
+        assert!(matches!(&direct.content[0], MessageContent::Text { text } if text == "1"));
         let output = compat.call(ctx.session_id, "node", serde_json::json!({"code":"import { starts } from \"fixture\"; console.log((await starts({})).content[0].text);"}).to_string()).await.unwrap();
         assert!(matches!(&output.content[0], MessageContent::Text { text } if text.contains('1')));
+    }
+
+    #[tokio::test]
+    async fn pinned_widget_placement_fixture_runs_without_source_adaptation() {
+        let capabilities = e_agent_tui::ui_protocol::native_capabilities();
+        let (client, mut server) = e_agent_tui::broker::channel(capabilities.clone());
+        let mut compat = PiCompat::with_ui(PiUiConfig::interactive(client, capabilities));
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pi-0.84.2/extensions/widget-placement.ts");
+        compat.load_extension(fixture).await.unwrap();
+
+        let broker = tokio::spawn(async move {
+            let mut operations = Vec::new();
+            for _ in 0..2 {
+                let envelope = server.recv().await.expect("widget request");
+                operations.push(envelope.operation.clone());
+                server.reply(envelope.request, e_agent_tui::ui_protocol::UiReply::Ack);
+            }
+            operations
+        });
+        let ctx = context();
+        compat
+            .observe(
+                &AgentEvent::SessionStart {
+                    session_id: ctx.session_id.to_string(),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let operations = broker.await.unwrap();
+        assert!(
+            operations.contains(&e_agent_tui::ui_protocol::UiOperation::Contribution(
+                e_agent_tui::ui_protocol::Contribution::Set {
+                    slot: "widget".into(),
+                    key: "widget-above".into(),
+                    content: "Above editor widget".into(),
+                },
+            ))
+        );
+        assert!(
+            operations.contains(&e_agent_tui::ui_protocol::UiOperation::Contribution(
+                e_agent_tui::ui_protocol::Contribution::Set {
+                    slot: "below-widget".into(),
+                    key: "widget-below".into(),
+                    content: "Below editor widget".into(),
+                },
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_component_routes_input_and_disposes_through_the_broker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom.ts");
+        std::fs::write(
+            &path,
+            r#"
+export default function (pi) {
+  pi.registerCommand("custom", {
+    description: "custom",
+    handler: async (_args, ctx) => {
+      ctx.ui.onTerminalInput((key) => ({ data: key === "x" ? "y" : key }));
+      return ctx.ui.custom(
+        async (_tui, _theme, _keybindings, done) => {
+        await Promise.resolve();
+        return {
+          render: () => ["ready"],
+          handleInput: (key) => { if (key === "y") done("accepted"); },
+          dispose: () => { throw new Error("dispose failure"); },
+        };
+      },
+      {
+        overlay: true,
+        onHandle: (handle) => {
+          handle.setHidden(true);
+          handle.setHidden(false);
+          handle.focus();
+          handle.unfocus();
+        },
+      },
+    );
+    },
+  });
+}
+"#,
+        )
+        .unwrap();
+        let capabilities = e_agent_tui::ui_protocol::native_capabilities();
+        let (client, mut server) = e_agent_tui::broker::channel(capabilities.clone());
+        let mut compat = PiCompat::with_ui(PiUiConfig::interactive(client, capabilities));
+        compat.load_extension(&path).await.unwrap();
+
+        let ctx = context();
+        let command = compat.command("custom", "", &ctx);
+        tokio::pin!(command);
+        let mut saw_overlay = false;
+        let mut saw_input_poll = false;
+        let mut saw_hide = false;
+        let mut saw_hidden = [false; 2];
+        let mut saw_focus = false;
+        let mut saw_unfocus = false;
+        loop {
+            tokio::select! {
+                result = &mut command => {
+                    result.unwrap();
+                    break;
+                }
+                envelope = server.recv() => {
+                    let envelope = envelope.expect("custom component request");
+                    match envelope.operation {
+                        e_agent_tui::ui_protocol::UiOperation::TerminalInput { .. } => {
+                            saw_input_poll = true;
+                            assert!(server.queue_input_poll(envelope.request));
+                            assert!(server.reply_input(e_agent_tui::input::InputEvent::Key(
+                                e_agent_tui::input::KeyEvent {
+                                    code: e_agent_tui::input::KeyCode::Char('x'),
+                                    modifiers: e_agent_tui::input::Modifiers::default(),
+                                    kind: e_agent_tui::input::KeyKind::Press,
+                                },
+                            )));
+                        }
+                        e_agent_tui::ui_protocol::UiOperation::Overlay { action, .. } => {
+                            match action {
+                                e_agent_tui::ui_protocol::OverlayAction::Show { content, .. } => {
+                                    saw_overlay = content == "ready";
+                                }
+                                e_agent_tui::ui_protocol::OverlayAction::Hide => saw_hide = true,
+                                e_agent_tui::ui_protocol::OverlayAction::SetHidden(hidden) => {
+                                    saw_hidden[usize::from(hidden)] = true;
+                                }
+                                e_agent_tui::ui_protocol::OverlayAction::Focus => saw_focus = true,
+                                e_agent_tui::ui_protocol::OverlayAction::Unfocus => saw_unfocus = true,
+                            }
+                            server.reply(envelope.request, e_agent_tui::ui_protocol::UiReply::Ack);
+                        }
+                        other => panic!("unexpected custom operation: {other:?}"),
+                    }
+                }
+            }
+        }
+        assert!(saw_overlay);
+        assert!(saw_input_poll);
+        assert!(saw_hide);
+        assert_eq!(saw_hidden, [true, true]);
+        assert!(saw_focus);
+        assert!(saw_unfocus);
+    }
+
+    #[tokio::test]
+    async fn tool_renderer_flows_from_agent_event_to_cached_native_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("render.ts");
+        std::fs::write(
+            &path,
+            r#"
+export default function (pi) {
+  pi.registerTool({
+    name: "rendered",
+    description: "rendered",
+    parameters: { type: "object", properties: { label: { type: "string" } } },
+    async execute() { return { content: [{ type: "text", text: "done" }] }; },
+    renderCall(args, _theme, context) {
+      context.state.count = (context.state.count || 0) + 1;
+      return { render: () => [`call:${args.label}:${context.state.count}`] };
+    },
+    renderResult(result, options, _theme, context) {
+      return { render: () => [`result:${result.text}:${options.isPartial}:${context.state.count}`] };
+    },
+  });
+}
+"#,
+        )
+        .unwrap();
+        let capabilities = e_agent_tui::ui_protocol::native_capabilities();
+        let (client, mut server) = e_agent_tui::broker::channel(capabilities.clone());
+        let mut compat = PiCompat::with_ui(PiUiConfig::interactive(client, capabilities));
+        compat.load_extension(path).await.unwrap();
+        let broker = tokio::spawn(async move {
+            let envelope = server.recv().await.expect("render request");
+            let operation = envelope.operation.clone();
+            server.reply(envelope.request, e_agent_tui::ui_protocol::UiReply::Ack);
+            operation
+        });
+        let ctx = context();
+        compat
+            .observe(
+                &AgentEvent::ToolExecutionStart {
+                    id: "tool-1".into(),
+                    name: "rendered".into(),
+                    input: serde_json::json!({"label":"x"}).to_string(),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let operation = broker.await.unwrap();
+        let e_agent_tui::ui_protocol::UiOperation::Frame { key, frame, .. } = operation else {
+            panic!("expected semantic frame")
+        };
+        assert_eq!(key, "tool-1");
+        assert_eq!(frame_text(&frame), "call:x:1");
+    }
+
+    #[tokio::test]
+    async fn message_and_entry_renderers_publish_isolated_cached_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("entries.ts");
+        std::fs::write(
+            &path,
+            r#"
+export default function (pi) {
+  pi.registerMessageRenderer("status", (message) => ({ render: () => [`message:${message.content}`] }));
+  pi.registerEntryRenderer("card", (entry) => ({ render: () => [`entry:${entry.data.value}`] }));
+  pi.registerMessageRenderer("broken", () => { throw new Error("broken"); });
+  pi.registerCommand("publish", {
+    description: "publish",
+    handler: async () => {
+      pi.sendMessage({ customType: "status", content: "ok", display: true });
+      pi.sendMessage({ customType: "broken", content: "fallback", display: true });
+      pi.appendEntry("card", { value: "saved" });
+    },
+  });
+}
+"#,
+        )
+        .unwrap();
+        let capabilities = e_agent_tui::ui_protocol::native_capabilities();
+        let (client, mut server) = e_agent_tui::broker::channel(capabilities.clone());
+        let mut compat = PiCompat::with_ui(PiUiConfig::interactive(client, capabilities));
+        compat.load_extension(path).await.unwrap();
+        let ctx = context();
+        let command = compat.command("publish", "", &ctx);
+        tokio::pin!(command);
+        let mut frames = Vec::new();
+        loop {
+            tokio::select! {
+                result = &mut command => {
+                    result.unwrap();
+                    break;
+                }
+                envelope = server.recv() => {
+                    let envelope = envelope.expect("render request");
+                    if let e_agent_tui::ui_protocol::UiOperation::Frame { frame, .. } = envelope.operation {
+                        frames.push(frame_text(&frame));
+                    }
+                    server.reply(envelope.request, e_agent_tui::ui_protocol::UiReply::Ack);
+                }
+            }
+        }
+        assert!(frames.contains(&"message:ok".to_string()));
+        assert!(frames.contains(&"entry:saved".to_string()));
+        assert!(!frames.iter().any(|frame| frame.contains("fallback")));
+        assert_eq!(compat.take_host_actions().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn pinned_modal_editor_fixture_mounts_without_source_adaptation() {
+        let capabilities = e_agent_tui::ui_protocol::native_capabilities();
+        let (client, mut server) = e_agent_tui::broker::channel(capabilities.clone());
+        let mut compat = PiCompat::with_ui(PiUiConfig::interactive(client, capabilities));
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pi-0.84.2/extensions/modal-editor.ts");
+        compat.load_extension(fixture).await.unwrap();
+        let broker = tokio::spawn(async move {
+            let envelope = server.recv().await.expect("editor frame");
+            let operation = envelope.operation.clone();
+            server.reply(envelope.request, e_agent_tui::ui_protocol::UiReply::Ack);
+            (server, operation)
+        });
+        let ctx = context();
+        compat
+            .observe(
+                &AgentEvent::SessionStart {
+                    session_id: ctx.session_id.to_string(),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let (mut server, operation) = broker.await.unwrap();
+        assert!(matches!(
+            operation,
+            e_agent_tui::ui_protocol::UiOperation::CustomEditor { content: Some(_) }
+        ));
+        assert!(server.publish_input(e_agent_tui::input::InputEvent::Text("a".into())));
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), server.recv())
+            .await
+            .expect("editor input timeout")
+            .expect("updated editor frame");
+        assert!(matches!(
+            &envelope.operation,
+            e_agent_tui::ui_protocol::UiOperation::CustomEditor { content: Some(content) }
+                if content.contains('a')
+        ));
+        server.reply(envelope.request, e_agent_tui::ui_protocol::UiReply::Ack);
+    }
+
+    #[test]
+    fn ui_mode_is_explicit() {
+        let ctx = context();
+        let headless = PiCompat::default();
+        assert_eq!(headless.pi_context(&ctx)["mode"], "print");
+        assert_eq!(headless.pi_context(&ctx)["hasUI"], false);
+
+        let capabilities = e_agent_tui::ui_protocol::UiCapabilities::default();
+        let (client, _server) = e_agent_tui::broker::channel(capabilities.clone());
+        let interactive = PiCompat::with_ui(PiUiConfig::interactive(client, capabilities));
+        assert_eq!(interactive.pi_context(&ctx)["mode"], "tui");
+        assert_eq!(interactive.pi_context(&ctx)["hasUI"], true);
     }
 
     #[test]
@@ -1517,7 +2252,7 @@ export default function (pi) {
         );
         assert!(
             matrix.iter().any(
-                |item| item.name == "custom-ui" && item.status == CapabilityStatus::Unsupported
+                |item| item.name == "pi-ui-0.84.2" && item.status == CapabilityStatus::Partial
             )
         );
         assert!(PiCompat::unsupported_capabilities().contains(&"registerProvider"));
